@@ -1,24 +1,47 @@
-﻿from dataclasses import dataclass
+﻿from dataclasses import dataclass, field
+from typing import Dict, Any
 from scoring.weights import Weights
 from bus.schema import Decision
+from scoring.rules.take_profit import should_take_profit
+from scoring.rules.stop_loss import should_stop_loss
+from scoring.rules.trailing import trailing_exit
 
 @dataclass
 class RiskGate:
     weights: Weights | None = None
-    max_exposure: float = 1.0  # (확장 예정)
+    max_exposure: float = 1.0
+    peaks: Dict[str, float] = field(default_factory=dict)  # 심볼별 고점 관리(트레일링용)
 
     def __post_init__(self):
         if self.weights is None:
             self.weights = Weights()
 
-    def apply(self, score: float, snapshot) -> Decision:
+    def apply(self, score: float, snapshot: Dict[str, Any]) -> Decision:
         """
-        단순 규칙:
-        - score >= buy_threshold  → BUY
-        - score <= sell_threshold → SELL
-        - 그 외 → 대기(None)
+        순서:
+        1) 보유중이면 출구 규칙(익절/손절/트레일링) 우선
+        2) 아니면 점수 임계값으로 진입/청산
         """
-        sym = snapshot.get("symbol","TEST")
+        sym = snapshot.get("symbol", "TEST")
+        price = float(snapshot.get("price", 0.0))
+        pos: dict | None = snapshot.get("position")
+
+        # === 보유중인 경우: 출구 규칙 ===
+        if pos and float(pos.get("qty", 0)) > 0:
+            # 1) 익절
+            if should_take_profit(pos, price):
+                return Decision(sym, "SELL", float(pos.get("qty", 0)), "take_profit")
+            # 2) 손절
+            if should_stop_loss(pos, price):
+                return Decision(sym, "SELL", float(pos.get("qty", 0)), "stop_loss")
+            # 3) 트레일링 스톱
+            peak = self.peaks.get(sym)
+            exit_sig, new_peak = trailing_exit(pos, price, peak_price=peak, trail_pct=0.02)
+            self.peaks[sym] = new_peak
+            if exit_sig:
+                return Decision(sym, "SELL", float(pos.get("qty", 0)), "trailing_stop")
+
+        # === 미보유 또는 출구 신호 없음: 점수로 판단 ===
         if score >= self.weights.buy_threshold:
             return Decision(sym, "BUY", 1.0, "score>=buy_threshold")
         if score <= self.weights.sell_threshold:
