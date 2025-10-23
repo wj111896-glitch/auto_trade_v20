@@ -1,5 +1,12 @@
-# simple in-process bus (placeholder)
-from obs.log import log_info
+from queue import Queue
 
-def publish(evt):
-    log_info(f"[BUS] {evt}")
+class MessageBus:
+    def __init__(self):
+        self.q = Queue()
+    def publish(self, ev):
+        self.q.put(ev)
+    def poll(self):
+        try:
+            return self.q.get_nowait()
+        except Exception:
+            return None
