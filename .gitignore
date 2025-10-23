@@ -1,4 +1,58 @@
-﻿__pycache__/
-*.pyc
+﻿# ===============================
+# auto_trade_v20 프로젝트용 .gitignore
+# ===============================
+
+# ---- Python 캐시/임시 파일 ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec
+
+# ---- 가상환경 ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- 로깅 및 실행 로그 ----
 logs/
+*.log
+*.out
+*.err
+
+# ---- 뉴스/리포트 로그 (보유 종목/일간은 올리지만, 테스트용 제외 가능) ----
+# news_logs/  ← 만약 GitHub에 뉴스 결과 안 올리고 싶다면 주석 해제하세요.
+
+# ---- 환경 및 개인 설정 ----
 secrets.env
+config_local.py
+*.ini
+*.cfg
+
+# ---- OS / 편집기 파일 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*
+*.bak
+*.tmp
+*.swp
+
+# ---- IDE 설정 ----
+.vscode/
+.idea/
+*.code-workspace
+
+# ---- Git 자체 ----
+.gitignore
+
+# ---- 테스트 / 임시 ----
+test_*.py
+run_test_*.py
+
