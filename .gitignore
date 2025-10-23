@@ -1,3 +1,4 @@
 ﻿__pycache__/
 *.pyc
 logs/
+secrets.env
