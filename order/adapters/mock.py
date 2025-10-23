@@ -1,6 +1,5 @@
-from obs.log import log_info
-
-class MockOrderAdapter:
-    def send_order(self, req):
-        log_info(f"[MOCK ORDER] {req}")
-        return {"status": "FILLED", "order_id": "MOCK123"}
+﻿class MockAdapter:
+    def buy(self, decision):
+        print("[MOCK BUY]", decision.symbol, decision.size, decision.reason)
+    def sell(self, decision):
+        print("[MOCK SELL]", decision.symbol, decision.size, decision.reason)
