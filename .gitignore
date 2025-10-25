@@ -56,3 +56,10 @@ desktop.ini
 test_*.py
 run_test_*.py
 
+# logs & artifacts
+*.csv
+__pycache__/
+*.pyc
+.env
+
+
