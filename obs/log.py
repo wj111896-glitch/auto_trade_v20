@@ -1,37 +1,25 @@
-import logging, os
-from logging.handlers import RotatingFileHandler
+import logging
+import os
 
-_LOGGER = None
+def get_logger(name="app", logfile=None, level=logging.INFO):
+    """단순 콘솔+파일 로거 (없으면 자동 생성)"""
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger  # 이미 세팅된 로거 재사용
 
-def _ensure_logger():
-    global _LOGGER
-    if _LOGGER:
-        return _LOGGER
+    logger.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 
-    os.makedirs("logs", exist_ok=True)
-    logger = logging.getLogger("auto_trade_v20")
-    logger.setLevel(logging.INFO)
-
-    # 콘솔
+    # 콘솔 출력
     ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-
-    # 파일 (logs/app.log, 1MB 로테이션 3개)
-    fh = RotatingFileHandler("logs/app.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"))
-
+    ch.setFormatter(fmt)
     logger.addHandler(ch)
-    logger.addHandler(fh)
 
-    _LOGGER = logger
-    return _LOGGER
+    # 파일 출력 (logs 폴더 자동 생성)
+    if logfile:
+        os.makedirs(os.path.dirname(logfile), exist_ok=True)
+        fh = logging.FileHandler(logfile, encoding="utf-8")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
 
-def info(msg: str, *args, **kwargs):
-    _ensure_logger().info(msg, *args, **kwargs)
-
-def error(msg: str, *args, **kwargs):
-    _ensure_logger().error(msg, *args, **kwargs)
-
-def debug(msg: str, *args, **kwargs):
-    _ensure_logger().debug(msg, *args, **kwargs)
-
+    return logger
