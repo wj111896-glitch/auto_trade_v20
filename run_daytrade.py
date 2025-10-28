@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import argparse
+import json
 from datetime import datetime
 
 # ==== ① 경로 자동 세팅 ====
@@ -26,6 +27,11 @@ from scoring.rules.stop_loss import StopLoss
 from scoring.rules.trailing import TrailingStop
 from risk.core import RiskGate
 from order.router import OrderRouter
+from tools.news_signal import NewsSignal
+from obs.metrics import BiasMeter
+from obs.report import save_day_report
+from obs.health import preflight_check   # ✅ 헬스체크
+from obs.alert import send_message       # ✅ 텔레그램 알림
 
 # ==== ③ 로거 생성 (일자별 파일 자동 저장) ====
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -78,11 +84,30 @@ def main():
     parser.add_argument("--symbols", nargs="+", default=["005930","000660","035420"], help="심볼 목록")
     parser.add_argument("--max-ticks", type=int, default=3000, help="최대 처리 틱 수")
     parser.add_argument("--sleep-ms", type=int, default=5, help="틱 간 슬립(ms)")
+    # ✅ 매수/매도 알림 스위치
+    parser.add_argument("--notify-buys",  action="store_true", help="매수 체결 텔레그램 알림 ON")
+    parser.add_argument("--notify-sells", action="store_true", help="매도 체결 텔레그램 알림 ON")
     args = parser.parse_args()
+
+    # ✅ 프리플라이트 체크 (폴더/권한/뉴스 파일 등)
+    if not preflight_check(BASE_DIR, args.symbols, logger=log):
+        return
+
+    # ✅ 시작 알림은 프리플라이트 통과 후에!
+    send_message("✅ 오부장 단타 v20 시작 (preflight OK)")
 
     cfg = DAYTRADE
     engine, risk, router, tp, sl, tr = build_components(cfg)
     feed = PriceFeedMock(symbols=args.symbols)
+
+    # ✅ 뉴스 시그널 & 바이어스 훅
+    NEWS_GAIN = 0.10
+    news = NewsSignal(
+        base_dir=BASE_DIR,
+        recency_days=3,
+        keyword_map={"005930": "삼성전자", "000660": "SK하이닉스", "035420": "NAVER"},
+    )
+    bias = BiasMeter(gain=NEWS_GAIN, logger=log)
 
     portfolio: dict[str, dict] = {}
 
@@ -105,10 +130,13 @@ def main():
         # 리스크 킬스위치
         if not risk.heartbeat_ok():
             log.warning("RISK_KILL_SWITCH", extra={"ticks": ticks})
+            send_message("🛑 RISK_KILL_SWITCH 발동 — 세션 중단")
             break
 
-        # 점수 계산
-        score = engine.score(tick)
+        # 점수 계산 → 뉴스 바이어스 훅으로 보정
+        score_raw = engine.score(tick)
+        score, bias_applied = bias.adjust(score_raw, sym, news)
+
         pos = portfolio.get(sym)
 
         # ============== 진입 ==============
@@ -123,7 +151,10 @@ def main():
                     trades.append({
                         "ts": datetime.now().strftime("%H:%M:%S"),
                         "side": "BUY", "sym": sym, "qty": qty, "px": round(px,2),
-                        "score": round(score,4), "reason": "score>=buy_th"
+                        "score_raw": round(score_raw,4),
+                        "score": round(score,4),
+                        "news_bias_applied": round(bias_applied,4),
+                        "reason": "score>=buy_th"
                     })
                     log.info(
                         "BUY",
@@ -133,6 +164,9 @@ def main():
                             "exposure": round(getattr(risk, "exposure_now", 0.0), 3)
                         }
                     )
+                    # ✅ 매수 알림: 스위치가 켜진 경우에만 전송
+                    if args.notify_buys:
+                        send_message(f"📈 BUY {sym} x{qty} @ {round(px,2)} | score={round(score,3)}")
 
         # ============== 청산 ==============
         pos = portfolio.get(sym)
@@ -166,7 +200,10 @@ def main():
                 trades.append({
                     "ts": datetime.now().strftime("%H:%M:%S"),
                     "side": "SELL", "sym": sym, "qty": qty, "px": round(px,2),
-                    "pnl_pct": round(pnl_pct,3), "reason": reason
+                    "pnl_pct": round(pnl_pct,3), "reason": reason,
+                    "score_raw": round(score_raw,4),
+                    "score": round(score,4),
+                    "news_bias_applied": round(bias_applied,4),
                 })
                 log.info(
                     "SELL",
@@ -177,6 +214,9 @@ def main():
                         "score": round(score,4)
                     }
                 )
+                # ✅ 매도 알림: 스위치가 켜진 경우에만 전송
+                if args.notify_sells:
+                    send_message(f"📉 SELL {sym} x{qty} @ {round(px,2)} | PnL {round(pnl_pct,2)}% ({reason})")
 
         # 종료 조건(모의)
         if ticks >= args.max_ticks:
@@ -192,36 +232,45 @@ def main():
 
     # === 세션 요약 ===
     avg_pnl = (realized_pnl_sum_pct / trade_sell_cnt) if trade_sell_cnt > 0 else 0.0
-    log.info(
-        "SESSION_SUMMARY",
-        extra={
-            "buys": trade_buy_cnt,
-            "sells": trade_sell_cnt,
-            "realized_pnl_sum_pct": round(realized_pnl_sum_pct, 3),
-            "avg_pnl_pct_per_trade": round(avg_pnl, 3),
-            "logfile": log_path
-        }
-    )
+    summary = {
+        "buys": trade_buy_cnt,
+        "sells": trade_sell_cnt,
+        "realized_pnl_sum_pct": round(realized_pnl_sum_pct, 3),
+        "avg_pnl_pct_per_trade": round(avg_pnl, 3),
+        "logfile": log_path,
+    }
+
+    # ✅ 뉴스 바이어스 집계(전체 + 심볼별)
+    summary.update(bias.summary_dict())
+
+    # 콘솔/로그 + 리포트 저장
+    log.info("SESSION_SUMMARY | " + json.dumps(summary, ensure_ascii=False))
+    save_day_report(summary, BASE_DIR)
+
+    # ✅ 세션 종료 알림(요약) — 한 번만 전송
+    send_message(f"🧾 세션 종료 | buys={trade_buy_cnt}, sells={trade_sell_cnt}, pnl_sum={round(realized_pnl_sum_pct,3)}%")
 
     # === CSV 저장 ===
     try:
         csv_path = os.path.join(LOG_DIR, f"trades_{datetime.now():%Y-%m-%d_%H%M%S}.csv")
         with open(csv_path, "w", encoding="utf-8") as f:
-            f.write("ts,side,sym,qty,px,score,pnl_pct,reason\n")
+            f.write("ts,side,sym,qty,px,score_raw,score,news_bias_applied,pnl_pct,reason\n")
             for t in trades:
-                f.write("{ts},{side},{sym},{qty},{px},{score},{pnl},{reason}\n".format(
+                f.write("{ts},{side},{sym},{qty},{px},{score_raw},{score},{bias},{pnl},{reason}\n".format(
                     ts=t.get("ts",""),
                     side=t.get("side",""),
                     sym=t.get("sym",""),
                     qty=t.get("qty",""),
                     px=t.get("px",""),
+                    score_raw=t.get("score_raw",""),
                     score=t.get("score",""),
+                    bias=t.get("news_bias_applied",""),
                     pnl=t.get("pnl_pct",""),
                     reason=t.get("reason",""),
                 ))
-        log.info("TRADES_SAVED", extra={"csv": csv_path})
+        log.info("TRADES_SAVED | " + json.dumps({"csv": csv_path}, ensure_ascii=False))
     except Exception as e:
-        log.info("TRADES_SAVE_FAILED", extra={"err": str(e)})
+        log.info("TRADES_SAVE_FAILED | " + json.dumps({"err": str(e)}, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()

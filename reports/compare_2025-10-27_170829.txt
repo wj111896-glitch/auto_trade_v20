@@ -1,0 +1,23 @@
+=== DAILY REPORT COMPARE ===
+A(이전): day_report_2025-10-27_150419.json
+B(오늘): day_report_2025-10-27_164424.json
+
+realized_pnl_sum_pct     : -11.835  (B - A)
+avg_pnl_pct_per_trade    : -0.124  (B - A)
+buys                     : -7.000  (B - A)
+sells                    : -7.000  (B - A)
+news_bias_hits           : 0.000  (B - A)
+news_bias_avg_applied    : 0.000  (B - A)
+news_bias_max_applied    : 0.000  (B - A)
+news_bias_min_applied    : 0.000  (B - A)
+
+-- Symbol news bias delta (B - A) --
+000660: +0.1000
+005930: +0.1000
+035420: -0.1000
+
+=== LATEST TREND ===
+files: day_report_2025-10-27_150419.json, day_report_2025-10-27_164424.json
+avg_realized_pnl_sum_pct   : -22.634
+avg_avg_pnl_pct_per_trade  : -0.213
+avg_news_bias_avg_applied  : 0.033

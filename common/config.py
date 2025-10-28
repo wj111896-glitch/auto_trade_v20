@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""
+공통 설정파일 (config.py)
+v20 전체에서 공용: DAYTRADE 프리셋 + 브로커 설정 병행
+"""
+
 # ====== BEGIN: DAYTRADE PRESET ======
 DAYTRADE = {
     "weights": {
@@ -29,8 +35,16 @@ DAYTRADE = {
 # ====== END: DAYTRADE PRESET ======
 
 # ---- legacy constants for risk.core compatibility ----
-# risk/core.py가 옛날 방식으로 불러와도 에러 나지 않게 하는 호환 상수
 TP_PCT = 0.012     # +1.2%
 SL_PCT = -0.008    # -0.8%
 TRAIL_PCT = 0.010  # 1.0%
+
+# ====== BEGIN: BROKER SETTINGS ======
+# v20 허브/라우터/어댑터 공용
+BROKER = "KIWOOM"       # "MOCK" | "KIWOOM"
+ACCOUNT_NO = "00000000"  # 모의계좌 번호
+DRY_RUN = True           # 실거래 False, 모의 True
+ORDER_RATE_LIMIT_MS = 120
+# ====== END: BROKER SETTINGS ======
+
 

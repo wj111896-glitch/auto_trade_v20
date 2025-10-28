@@ -1,0 +1,16 @@
+{
+  "buys": 106,
+  "sells": 104,
+  "realized_pnl_sum_pct": -28.552,
+  "avg_pnl_pct_per_trade": -0.275,
+  "logfile": "C:\\Users\\kimta\\auto_trade_v20\\logs\\daytrade_2025-10-27.log",
+  "news_bias_hits": 1200,
+  "news_bias_avg_applied": 0.0333,
+  "news_bias_max_applied": 0.1,
+  "news_bias_min_applied": -0.1,
+  "news_bias_symbols": {
+    "005930": 0.1,
+    "000660": 0.1,
+    "035420": -0.1
+  }
+}

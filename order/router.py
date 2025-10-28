@@ -1,58 +1,71 @@
-﻿# -*- coding: utf-8 -*-
-"""
-Mock 주문 라우터 — 단타 러너(run_daytrade.py) 호환용
-BUY/SELL 명령을 흉내 내며 콘솔/로그로 출력만 수행합니다.
-"""
+﻿# C:\Users\kimta\auto_trade_v20\order\router.py
+from __future__ import annotations
+import threading
+from typing import Optional
+from common import config
 
-import time
-from types import SimpleNamespace
-from obs.log import get_logger
-
-log = get_logger("order.router")
+if config.BROKER.upper() == "KIWOOM":
+    from order.adapters.kiwoom import KiwoomAdapter as Adapter
+    _adapter_kwargs = {
+        "account_no": config.ACCOUNT_NO,
+        "dry_run": config.DRY_RUN,
+        "rate_limit_ms": getattr(config, "ORDER_RATE_LIMIT_MS", 120),
+    }
+else:
+    from order.adapters.mock import MockAdapter as Adapter
+    _adapter_kwargs = {}
 
 class OrderRouter:
-    def __init__(self, adapter: str | None = None, **kwargs):
-        # adapter 인자는 무시하고 mock로 동작 (호환용)
-        self.adapter = adapter or "mock"
-        self._orders = []  # 단순 기록용
+    def __init__(self, logger=None):
+        self.logger = logger
+        self._lock = threading.RLock()
+        self._adapter = Adapter(logger=logger, **_adapter_kwargs)
 
-    def buy(self, sym: str, qty: float, price: float):
-        """
-        모의 매수 주문 실행 (즉시 체결 가정)
-        """
-        order = SimpleNamespace(
-            side="BUY",
-            symbol=sym,
-            qty=qty,
-            price=price,
-            ts=time.time()
-        )
-        self._orders.append(order)
-        # log.info(f"BUY  {sym} qty={qty} px={price:.2f}")
-        return order
+    def connect(self) -> bool:
+        with self._lock:
+            ok = self._adapter.connect()
+            if ok and self.logger:
+                self.logger.info(f"[OrderRouter] connected -> {config.BROKER} (dry_run={getattr(self._adapter,'dry_run',None)})")
+            return ok
 
-    def sell(self, sym: str, qty: float, price: float):
-        """
-        모의 매도 주문 실행 (즉시 체결 가정)
-        """
-        order = SimpleNamespace(
-            side="SELL",
-            symbol=sym,
-            qty=qty,
-            price=price,
-            ts=time.time()
-        )
-        self._orders.append(order)
-        # log.info(f"SELL {sym} qty={qty} px={price:.2f}")
-        return order
+    def close(self):
+        with self._lock:
+            self._adapter.close()
 
-    def cancel(self, sym: str):
-        """
-        모의 주문 취소 (단순 로그용)
-        """
-        log.info(f"CANCEL {sym}")
-        return True
+    def get_cash(self) -> int:
+        with self._lock:
+            return self._adapter.get_cash()
 
-    def orders(self):
-        """기록된 주문 리스트 반환"""
-        return list(self._orders)
+    def get_positions(self):
+        with self._lock:
+            return self._adapter.get_positions()
+
+    def buy(self, symbol: str, qty: int, price: Optional[float]=None, order_type: str="MKT", user_tag: Optional[str]=None):
+        with self._lock:
+            return self._adapter.place_order(symbol, "BUY", qty, price=price, order_type=order_type, user_tag=user_tag)
+
+    def sell(self, symbol: str, qty: int, price: Optional[float]=None, order_type: str="MKT", user_tag: Optional[str]=None):
+        with self._lock:
+            return self._adapter.place_order(symbol, "SELL", qty, price=price, order_type=order_type, user_tag=user_tag)
+
+    def cancel(self, order_id: str):
+        with self._lock:
+            return self._adapter.cancel_order(order_id)
+
+    def route(self, decision: dict):
+        action = (decision.get("action") or "HOLD").upper()
+        symbol = decision.get("symbol")
+        qty    = int(decision.get("qty", 0) or 0)
+        order_type = decision.get("order_type", "MKT")
+        price  = decision.get("price")
+        tag    = decision.get("tag")
+        if action == "HOLD" or qty <= 0:
+            if self.logger: self.logger.info("[OrderRouter] HOLD %s", decision)
+            return None
+        if action == "BUY":
+            return self.buy(symbol, qty, price=price, order_type=order_type, user_tag=tag)
+        if action == "SELL":
+            return self.sell(symbol, qty, price=price, order_type=order_type, user_tag=tag)
+        if self.logger: self.logger.warning("[OrderRouter] unknown action: %s", action)
+        return None
+

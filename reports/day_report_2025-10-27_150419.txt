@@ -1,0 +1,12 @@
+=== DAYTRADE REPORT ===
+생성시각: 2025-10-27 15:04:19
+
+buys                     : 113
+sells                    : 111
+realized_pnl_sum_pct     : -16.717
+avg_pnl_pct_per_trade    : -0.151
+logfile                  : C:\Users\kimta\auto_trade_v20\logs\daytrade_2025-10-27.log
+news_bias_hits           : 1200
+news_bias_avg_applied    : 0.0333
+news_bias_max_applied    : 0.1
+news_bias_min_applied    : -0.1
