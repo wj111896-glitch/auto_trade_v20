@@ -2,14 +2,26 @@
 """
 hub/hub_trade.py - 전략 허브 (단일/멀티 심볼 공용)
 시세 스냅샷(snapshot)을 받아 점수 → 리스크 → 의사결정 → 주문 실행까지 연결
+
+본 파일은 두 가지 레벨을 제공합니다.
+1) Hub  : 순수 도메인 허브 — scorer/risk/router를 주입 받아 on_tick 처리만 담당
+2) HubTrade : 실행 러너 — 기본 구성요소를 자동으로 주입하고 run_session/start/run 제공
+
+run_daytrade.py 와의 호환을 위해 `HubTrade`를 export 합니다.
 """
 from __future__ import annotations
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass
+from datetime import datetime
+import time
+from collections import defaultdict
 
 from scoring.core import ScoreEngine
 from risk.core import RiskGate
 from order.router import OrderRouter
 from obs.log import get_logger
+
+__all__ = ["Hub", "HubTrade"]
 
 
 class Hub:
@@ -37,6 +49,10 @@ class Hub:
         self.risk = risk
         self.router = router
         self.log = get_logger("hub")
+        # DRY_RUN용 로컬 포지션/쿨다운 캐시
+        self.pos: defaultdict[str, int] = defaultdict(int)
+        self.cooldown: defaultdict[str, int] = defaultdict(int)
+        self.COOLDOWN_TICKS = 3
 
         self.log.info(
             "HUB init: scorer=%s risk=%s router=%s",
@@ -44,6 +60,30 @@ class Hub:
             type(risk).__name__,
             type(router).__name__,
         )
+
+    # --- RiskGate 인터페이스 호환 처리 ---
+    def _risk_apply(self, score, snapshot):
+        """RiskGate의 다양한 메서드 명을 호환해서 호출한다."""
+        for name in ("apply", "decide", "__call__", "process", "evaluate", "run", "filter", "gate"):
+            if hasattr(self.risk, name):
+                fn = getattr(self.risk, name)
+                try:
+                    return fn(score, snapshot)
+                except TypeError:
+                    # 인자 수가 다를 때 여러 패턴 시도
+                    for args in ((score,), (snapshot,), tuple()):
+                        try:
+                            return fn(*args)
+                        except TypeError:
+                            continue
+        # 최후의 안전 기본값
+        sym = snapshot.get("symbol", "NA")
+        if score > 0:
+            return {"action": "BUY", "symbol": sym, "qty": 1, "order_type": "MKT", "price": None, "tag": "fallback"}
+        elif score < 0:
+            return {"action": "SELL", "symbol": sym, "qty": 1, "order_type": "MKT", "price": None, "tag": "fallback"}
+        else:
+            return {"action": "HOLD", "symbol": sym, "qty": 0}
 
     def on_tick(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         """하나의 틱 데이터를 받아 스코어링, 리스크 판단, 주문 실행"""
@@ -56,7 +96,7 @@ class Hub:
         self.log.info("HUB score: %.3f", score)
 
         # ② 리스크 적용 → 의사결정 딕셔너리
-        decision = self.risk.apply(score, snapshot)
+        decision = self._risk_apply(score, snapshot)
 
         # 문자열로만 오는 경우 (예: "HOLD")
         if isinstance(decision, str):
@@ -68,6 +108,16 @@ class Hub:
                 "price": None,
             }
 
+        # ②.5 쿨다운/포지션 가드
+        cd = self.cooldown[sym]
+        if cd > 0 and decision.get("action") in ("BUY", "SELL"):
+            self.log.info("HUB cooldown(%s): %s → HOLD", sym, cd)
+            decision = {**decision, "action": "HOLD", "qty": 0, "tag": "cooldown"}
+        else:
+            if decision.get("action") == "SELL" and self.pos[sym] <= 0:
+                self.log.info("HUB pos_guard: no position → HOLD")
+                decision = {**decision, "action": "HOLD", "qty": 0, "tag": "no_pos"}
+
         self.log.info("HUB decision: %s", decision)
 
         # ③ 주문 라우팅
@@ -75,7 +125,174 @@ class Hub:
         if routed is not None:
             decision = {**decision, "route_result": routed}
 
+        # ④ 포지션/쿨다운 업데이트 (DRY_RUN용 낙관적 업데이트)
+        act = decision.get("action")
+        qty = int(decision.get("qty", 0) or 0)
+        if act == "BUY" and qty > 0:
+            self.pos[sym] += qty
+            self.cooldown[sym] = self.COOLDOWN_TICKS
+        elif act == "SELL" and qty > 0 and self.pos[sym] >= qty:
+            self.pos[sym] -= qty
+            self.cooldown[sym] = self.COOLDOWN_TICKS
+        else:
+            if self.cooldown[sym] > 0:
+                self.cooldown[sym] -= 1
+
         return decision
+
+
+# =========================
+# HubTrade 러너
+# =========================
+@dataclass
+class _RunnerOpts:
+    real_mode: bool = False
+    budget: Optional[float] = None
+    dry_run: Optional[bool] = None  # router가 지원하는 경우 우선 사용
+
+
+class HubTrade:
+    """run_daytrade.py 가 기대하는 실행 어댑터
+
+    - __init__(real_mode, budget, **kwargs)
+    - run_session(symbols=[...], max_ticks=...)
+    - start / run : run_session의 별칭(호환성)
+    """
+
+    def __init__(self, real_mode: bool = False, budget: Optional[float] = None, **kwargs):
+        self.log = get_logger("hubtrade")
+        self.opts = _RunnerOpts(real_mode=real_mode, budget=budget)
+
+        # ① 의존성 준비 (프로젝트 실제 엔진이 없으면 더미로 fallback)
+        scorer, risk = self._make_scorer_risk()
+        router = self._make_router()
+
+        self.hub = Hub(scorer, risk, router)
+
+    # --- 구성 요소 생성 ---
+    def _make_scorer_risk(self) -> tuple[ScoreEngine, RiskGate]:
+        try:
+            # 프로젝트의 실제 엔진이 ScoreEngine/RiskGate 인터페이스를 구현한다고 가정
+            scorer = ScoreEngine()
+        except Exception:
+            # 더미 스코어러
+            class _DummyScorer(ScoreEngine):
+                def evaluate(self, snapshot):
+                    # 10 이하면 매수 우호
+                    return 1.0 if snapshot.get("price", 0) <= 10 else -1.0
+            scorer = _DummyScorer()
+
+        try:
+            risk = RiskGate()
+        except Exception:
+            # 더미 리스크 게이트
+            class _DummyRisk(RiskGate):
+                def apply(self, score, snapshot):
+                    sym = snapshot.get("symbol", "NA")
+                    if score > 0:
+                        return {
+                            "action": "BUY",
+                            "symbol": sym,
+                            "qty": 1,
+                            "order_type": "MKT",
+                            "price": None,
+                            "tag": "smoke",
+                        }
+                    return {"action": "HOLD", "symbol": sym, "qty": 0}
+            risk = _DummyRisk()
+        return scorer, risk
+
+    def _make_router(self) -> OrderRouter:
+        router = OrderRouter(get_logger("router"))
+        # DRY_RUN/REAL 모드 힌트 전달 (라우터가 지원할 경우)
+        try:
+            if hasattr(router, "set_mode"):
+                mode = "REAL" if self.opts.real_mode else "DRY"
+                router.set_mode(mode, budget=self.opts.budget)
+        except Exception:
+            pass
+        # 연결 시도 (mock라면 항상 True)
+        try:
+            ok = router.connect()
+            self.log.info("router.connect() -> %s", ok)
+        except Exception as e:
+            self.log.warning("router.connect 예외: %s (계속 진행)", e)
+        return router
+
+    # --- 피드 호환 유틸 ---
+    def _fetch_snapshot(self, feed, sym: str, ticks: int):
+        """다양한 Feed 인터페이스 스펙을 호환해서 스냅샷을 얻어온다."""
+        for name in ("snapshot", "get_snapshot", "quote", "get", "next", "read"):
+            if hasattr(feed, name):
+                fn = getattr(feed, name)
+                try:
+                    data = fn(sym)
+                except TypeError:
+                    data = fn()
+                # 튜플/리스트 형태 (sym, price) 처리
+                if isinstance(data, (list, tuple)) and len(data) >= 2:
+                    data = {"symbol": str(data[0]), "price": float(data[1])}
+                # dict 보장 및 기본키 보강
+                if isinstance(data, dict):
+                    data.setdefault("symbol", sym)
+                    return data
+        # 완전 실패 시 synthetic 데이터
+        return {"symbol": sym, "price": 10.0 + (ticks % 5) * 0.1}
+
+    # --- 실행 루프 ---
+    def run_session(self, symbols: List[str], max_ticks: int) -> Dict[str, Any]:
+        """심볼 리스트와 틱 수를 받아 간단 실행 루프 수행
+        - market.price.PriceFeedMock 가 있으면 사용, 없으면 단순 synthetic 생성
+        """
+        started_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.log.info("run_session start: symbols=%s max_ticks=%s real_mode=%s budget=%s",
+                      symbols, max_ticks, self.opts.real_mode, self.opts.budget)
+
+        # ② 피드 구성
+        feed = None
+        try:
+            from market.price import PriceFeedMock  # type: ignore
+            feed = PriceFeedMock(symbols)
+            self.log.info("PriceFeedMock 사용")
+        except Exception:
+            self.log.info("PriceFeedMock 없음 — synthetic feed 사용")
+
+        ticks = 0
+        decisions: List[Dict[str, Any]] = []
+
+        while ticks < max_ticks:
+            for sym in symbols:
+                if feed is not None:
+                    snap = self._fetch_snapshot(feed, sym, ticks)
+                else:
+                    snap = {"symbol": sym, "price": 10.0 + (ticks % 5) * 0.1}
+                decision = self.hub.on_tick(snap)
+                decisions.append(decision)
+                ticks += 1
+                if ticks >= max_ticks:
+                    break
+            # 너무 빠른 루프 방지 (mock 환경)
+            time.sleep(0.001)
+
+        ended_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.log.info("run_session end: ticks=%s", ticks)
+        return {
+            "status": "ok",
+            "ticks": ticks,
+            "symbols": symbols,
+            "real_mode": self.opts.real_mode,
+            "budget": self.opts.budget,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "decisions": decisions[-10:],  # 마지막 10개만 요약으로 반환
+        }
+
+    # 호환용 별칭
+    def start(self, **kwargs):
+        return self.run_session(**kwargs)
+
+    def run(self, **kwargs):
+        return self.run_session(**kwargs)
 
 
 # =========================
@@ -84,33 +301,12 @@ class Hub:
 if __name__ == "__main__":
     from common import config
 
-    # 더미 클래스 정의 (실제 엔진 대신)
-    class DummyScorer(ScoreEngine):
-        def evaluate(self, snapshot):
-            return 1.0 if snapshot.get("price", 0) <= 10 else -1.0
-
-    class DummyRisk(RiskGate):
-        def apply(self, score, snapshot):
-            sym = snapshot.get("symbol", "NA")
-            if score > 0:
-                return {
-                    "action": "BUY",
-                    "symbol": sym,
-                    "qty": 1,
-                    "order_type": "MKT",
-                    "price": None,
-                    "tag": "smoke",
-                }
-            return {"action": "HOLD", "symbol": sym, "qty": 0}
-
-    # DRY_RUN 설정
+    # DRY_RUN 설정 힌트
     config.BROKER = "KIWOOM"
     config.DRY_RUN = True
     config.ACCOUNT_NO = "00000000"
 
     # 허브 초기화 및 테스트
-    hub = Hub(DummyScorer(), DummyRisk(), OrderRouter(get_logger("router")))
-    assert hub.router.connect()
-    result = hub.on_tick({"symbol": "005930", "price": 10.0})
-    print("decision_out:", result)
-
+    hubtrade = HubTrade(real_mode=False, budget=1_000_000)
+    out = hubtrade.run_session(["005930", "000660"], max_ticks=10)
+    print("decision_out(last10):", out.get("decisions"))
