@@ -10,6 +10,7 @@ DAYTRADE = {
         "volume":   0.45,
         "tickflow": 0.35,
         "ta":       0.20,
+        "news":     0.10,  # 뉴스 감정 가중치 (초기값)
     },
     "thresholds": {
         "buy":   0.55,
@@ -20,16 +21,17 @@ DAYTRADE = {
         "sl_pct":       -0.008,  # -0.8%
         "trailing_pct":  0.010,  # 1.0%
     },
+    # 리스크 파라미터(권장값)
     "risk": {
-        "budget":                 100_000_000,  # 모의 예산(1억원)
-        "intraday_exposure_max":  0.60,         # 일중 총 노출 60%
-        "per_symbol_cap_min":     0.10,         # 종목 최소 캡
-        "per_symbol_cap_max":     0.15,         # 종목 최대 캡
-        "day_dd_kill":            0.03,         # 일중 DD -3%면 중지
+        "budget":                 10_000_000,  # 총 예산 1,000만원
+        "intraday_exposure_max":  0.50,        # 일중 총 노출 상한 50%
+        "per_symbol_cap_min":     0.05,        # (미사용, 향후용) 종목 최소 목표 5%
+        "per_symbol_cap_max":     0.12,        # 종목당 상한 12%
+        "day_dd_kill":            0.03,        # (향후) 일중 DD -3%면 중지
     },
     "ops": {
-        "cooldown_sec_after_fill": 60,   # 체결 직후 과열 진입 방지
-        "session_only": True,            # 정규장만(모의에선 무시 가능)
+        "cooldown_sec_after_fill": 60,  # 체결 직후 과열 진입 방지
+        "session_only": True,           # 정규장만(모의에선 무시 가능)
     }
 }
 # ====== END: DAYTRADE PRESET ======
@@ -41,10 +43,8 @@ TRAIL_PCT = 0.010  # 1.0%
 
 # ====== BEGIN: BROKER SETTINGS ======
 # v20 허브/라우터/어댑터 공용
-BROKER = "KIWOOM"       # "MOCK" | "KIWOOM"
-ACCOUNT_NO = "00000000"  # 모의계좌 번호
-DRY_RUN = True           # 실거래 False, 모의 True
+BROKER = "KIWOOM"         # "MOCK" | "KIWOOM"
+ACCOUNT_NO = "00000000"   # 모의/실계좌 번호
+DRY_RUN = True            # 안전 기본값: 실주문 차단 (내일 필요 시 False로)
 ORDER_RATE_LIMIT_MS = 120
 # ====== END: BROKER SETTINGS ======
-
-

@@ -1,89 +1,106 @@
 ﻿# -*- coding: utf-8 -*-
-from dataclasses import dataclass, field
-from typing import Dict
-from common.config import DAYTRADE
+"""
+risk/core.py — RiskGate (policies orchestrator, relaxed defaults)
+"""
+from __future__ import annotations
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+
+try:
+    from obs.log import get_logger
+except Exception:
+    class _L:
+        def info(self, *a, **k): print("[INFO]", *a)
+        def warning(self, *a, **k): print("[WARN]", *a)
+        def error(self, *a, **k): print("[ERROR]", *a)
+    def get_logger(name): return _L()
+
+try:
+    from common import config
+    _BUDGET = float(getattr(config, "BUDGET", 0.0) or 0.0)
+except Exception:
+    _BUDGET = 0.0
+
+# 정책들
+from .policies.base import Policy, PolicyResult
+from .policies.exposure import ExposurePolicy, ExposureParams
+from .policies.day_dd import DayDrawdownPolicy, DayDDParams
+# 필요 시 옵션 정책 추가:
+# from .policies.sector_cap import SectorCapPolicy, SectorParams
+# from .policies.throttle import ThrottlePolicy, ThrottleParams
 
 @dataclass
+class RiskContext:
+    budget: float = 10_000_000.0
+    today_pnl_pct: float = 0.0
+    now_ts: float = 0.0
+    dd_block_until_ts: float = 0.0
+    symbol_sector: Optional[Dict[str, str]] = None
+    sector_exposure: Optional[Dict[str, float]] = None
+    symbol_cool: Optional[Dict[str, int]] = None
+
 class RiskGate:
     """
-    단타 러너용 간단 리스크 게이트 (예산/노출/종목 캡 적용)
-      - allow_entry(sym, portfolio, price) -> bool
-      - size_for(sym, price) -> int
-      - heartbeat_ok() -> bool
+    새 API:
+      - allow_entry(symbol, portfolio, price, ctx=None) -> bool
+      - size_for(symbol, price, portfolio, ctx=None) -> int
+
+    레거시:
+      - apply(score, snapshot) -> decision(dict)
     """
-    cfg: dict = field(default_factory=lambda: DAYTRADE.get("risk", {}))
-    exposure_now: float = 0.0
-    day_dd: float = 0.0
-    _last_portfolio: Dict[str, dict] = field(default_factory=dict, repr=False)
 
-    # ----- helpers -----
-    def _budget(self) -> float:
-        return float(self.cfg.get("budget", 100_000_000))
+    def __init__(self, policies: Optional[List[Policy]] = None, budget: Optional[float] = None):
+        self.log = get_logger("risk")
+        self.budget = float(budget or _BUDGET or 10_000_000.0)
+        # 기본 정책 조합(완화형)
+        if policies is None:
+            policies = [
+                ExposurePolicy(ExposureParams(budget=self.budget)),
+                DayDrawdownPolicy(DayDDParams(max_dd_pct=-5.0, cool_minutes=15)),
+                # 필요시 아래 주석해제:
+                # SectorCapPolicy(SectorParams(sector_cap_pct=0.40, budget=self.budget)),
+                # ThrottlePolicy(ThrottleParams(cool_ticks=3)),
+            ]
+        self.policies = policies
 
-    def _per_symbol_cap(self) -> tuple[float, float]:
-        min_cap = float(self.cfg.get("per_symbol_cap_min", 0.10))
-        max_cap = float(self.cfg.get("per_symbol_cap_max", 0.15))
-        return min_cap, max_cap
+    # ---------- 유틸 ----------
+    def _merge_ctx(self, ctx: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        out = dict(ctx or {})
+        out.setdefault("budget", self.budget)
+        return out
 
-    def _intraday_exposure_max(self) -> float:
-        return float(self.cfg.get("intraday_exposure_max", 0.60))
-
-    def _calc_exposure(self, portfolio: Dict[str, dict]) -> float:
-        budget = self._budget()
-        if budget <= 0:
-            return 0.0
-        total_value = 0.0
-        for pos in portfolio.values():
-            qty = float(pos.get("qty", 0))
-            avg = float(pos.get("avg_px", 0.0))
-            total_value += max(0.0, qty * max(avg, 0.0))
-        return total_value / budget
-
-    def _symbol_value(self, sym: str, portfolio: Dict[str, dict], fallback_px: float) -> float:
-        pos = portfolio.get(sym)
-        if not pos:
-            return 0.0
-        qty = float(pos.get("qty", 0))
-        avg = float(pos.get("avg_px", 0.0)) or float(fallback_px)
-        return max(0.0, qty * max(avg, 0.0))
-
-    # ----- API -----
-    def allow_entry(self, sym: str, portfolio: Dict[str, dict], price: float) -> bool:
-        self._last_portfolio = dict(portfolio)  # snapshot
-        budget = self._budget()
-        _, max_cap = self._per_symbol_cap()
-        exposure_limit = self._intraday_exposure_max()
-
-        self.exposure_now = self._calc_exposure(portfolio)
-        if self.exposure_now >= exposure_limit:
-            return False
-
-        sym_value_now = self._symbol_value(sym, portfolio, price)
-        if sym_value_now >= max_cap * budget:
-            return False
-
+    # ---------- 새 API ----------
+    def allow_entry(self, symbol: str, portfolio: Dict[str, dict], price: float, ctx: Optional[Dict[str, Any]] = None) -> bool:
+        cx = self._merge_ctx(ctx)
+        for pol in self.policies:
+            r: PolicyResult = pol.check_entry(symbol, price, portfolio, cx)
+            if not r.allow:
+                self.log.warning(f"[RISK] block by {pol.__class__.__name__}: {r.reason}")
+                return False
         return True
 
-    def size_for(self, sym: str, price: float) -> int:
-        if price <= 0:
-            return 0
+    def size_for(self, symbol: str, price: float, portfolio: Dict[str, dict], ctx: Optional[Dict[str, Any]] = None) -> int:
+        cx = self._merge_ctx(ctx)
+        hints: List[int] = []
+        for pol in self.policies:
+            h = pol.size_hint(symbol, price, portfolio, cx)
+            if h is not None:
+                hints.append(int(h))
+        return max(0, min(hints) if hints else 0)
 
-        budget = self._budget()
-        _, max_cap = self._per_symbol_cap()
-        exposure_limit = self._intraday_exposure_max()
+    # ---------- 레거시 ----------
+    def apply(self, score: float, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        sym = str(snapshot.get("symbol", "NA"))
+        price = float(snapshot.get("price", 0.0) or 0.0)
+        pf = snapshot.get("_portfolio", {})  # 허브에서 전달 안 하면 빈 dict
+        if score > 0:
+            if self.allow_entry(sym, pf, price):
+                qty = self.size_for(sym, price, pf)
+                if qty > 0:
+                    return {"action": "BUY", "symbol": sym, "qty": int(qty), "order_type": "MKT", "price": None, "tag": "risk-legacy"}
+        elif score < 0:
+            pos = pf.get(sym)
+            if pos and int(pos.get("qty", 0)) > 0:
+                return {"action": "SELL", "symbol": sym, "qty": 1, "order_type": "MKT", "price": None, "tag": "risk-legacy"}
+        return {"action": "HOLD", "symbol": sym, "qty": 0}
 
-        portfolio = self._last_portfolio or {}
-        total_expo = self._calc_exposure(portfolio)
-        sym_value_now = self._symbol_value(sym, portfolio, price)
-
-        total_remaining_value = max(0.0, exposure_limit * budget - total_expo * budget)
-        sym_remaining_value   = max(0.0, max_cap * budget - sym_value_now)
-        target_value = min(total_remaining_value, sym_remaining_value)
-
-        if target_value < price:
-            return 0
-        return int(target_value // price)  # floor: never exceed caps
-
-    def heartbeat_ok(self) -> bool:
-        # TODO: cfg['day_dd_kill'] 도입 시 드로우다운 컷 적용
-        return True

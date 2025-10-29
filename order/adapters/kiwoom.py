@@ -2,28 +2,15 @@
 """
 KiwoomAdapter v1 (order/adapters/kiwoom.py)
 
-목표:
-- 실제 주문 연동을 위한 어댑터 스켈레톤 (DRY_RUN 우선 정상 동작)
-- router.py에서 동일 인터페이스로 호출 가능하도록 설계
-- Kiwoom OpenAPI+ 환경(ActiveX/QAxWidget) 의존부는 안전하게 분리
-
-사용 예 (router에서):
-    from order.adapters.kiwoom import KiwoomAdapter
-    adapter = KiwoomAdapter(account_no="12345678", dry_run=True)
-    adapter.connect()
-    oid = adapter.place_order(symbol="005930", side="BUY", qty=10, order_type="MKT")
-    adapter.cancel_order(oid)
-
-주의:
-- 실제 Kiwoom 연동은 Windows 32-bit Python + PyQt5 QAxWidget 이벤트 루프가 필요합니다.
-- 본 파일은 이벤트 핸들러/요청 포맷을 정의하고, DRY_RUN 로직은 즉시 사용 가능하도록 구현합니다.
-- 실제 연동 부분(TODO) 표기: 향후 hub_live에서 Qt 이벤트 루프와 함께 구동.
+- 우선 DRY_RUN(모의) 완전 동작
+- REAL 모드는 OpenAPI 연동 TODO로 남김(로그/스켈레톤 제공)
+- router.set_mode() → set_dry_run()/set_budget() 통해 모드/예산 동기화
 """
 from __future__ import annotations
 import time
 import uuid
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
 # ===== 공통 타입 =====
@@ -43,21 +30,20 @@ class Position:
 # ===== 어댑터 본체 =====
 class KiwoomAdapter:
     """Kiwoom 주문 어댑터 (v1)
-
-    - dry_run=True: 체결 시뮬레이션 (메모리 내 체결/포지션 관리)
-    - dry_run=False: Kiwoom OpenAPI+ 연동 (TODO: QAxWidget 이벤트/조회/주문)
+    - dry_run=True  : 체결 시뮬레이션 (메모리 내 체결/포지션 관리)
+    - dry_run=False : Kiwoom OpenAPI+ 연동 (TODO: QAxWidget 이벤트/조회/주문)
     """
 
     def __init__(self, account_no: str, dry_run: bool = True, logger=None, rate_limit_ms: int = 120):
         self.account_no = account_no
-        self.dry_run = dry_run
+        self.dry_run = bool(dry_run)
         self.logger = logger or self._get_default_logger()
-        self.rate_limit_ms = rate_limit_ms
+        self.rate_limit_ms = int(rate_limit_ms)
         self._rl_lock = threading.Lock()
 
         # 내부 상태 (DRY_RUN용)
         self._connected = False
-        self._cash = 100_000_000  # 1억원 가정 (DRY_RUN)
+        self._cash = 100_000_000  # 1억원 가정 (DRY_RUN 기본 예산)
         self._positions: Dict[str, Position] = {}
         self._orders: Dict[str, Dict[str, Any]] = {}
 
@@ -79,6 +65,22 @@ class KiwoomAdapter:
         with self._rl_lock:
             time.sleep(self.rate_limit_ms / 1000.0)
 
+    # ===== 모드/예산 동기화 (OrderRouter.set_mode에서 호출) =====
+    def set_dry_run(self, v: bool) -> None:
+        self.dry_run = bool(v)
+        mode = "DRY_RUN" if self.dry_run else "REAL"
+        self.logger.info(f"[KiwoomAdapter] set_dry_run({mode})")
+
+    def set_budget(self, budget: float) -> None:
+        """DRY_RUN에서는 가용 현금으로 반영. REAL은 내부 보관만."""
+        try:
+            b = float(budget)
+        except Exception:
+            b = 0.0
+        if self.dry_run and b > 0:
+            self._cash = b
+        self.logger.info(f"[KiwoomAdapter] budget set -> {b:,.0f}")
+
     # ===== 라이프사이클 =====
     def connect(self) -> bool:
         """브로커 연결.
@@ -94,13 +96,13 @@ class KiwoomAdapter:
             # 로그인 완료 이벤트 수신 후 self._connected = True
             self.logger.info("[KiwoomAdapter] REAL 모드 로그인 시도 (TODO)")
             self._connected = False
-            return False
+            return False  # 아직은 미구현이므로 False 반환
 
-    def ensure_ready(self):
+    def ensure_ready(self) -> None:
         if not self._connected:
             raise RuntimeError("KiwoomAdapter not connected")
 
-    def close(self):
+    def close(self) -> None:
         self.logger.info("[KiwoomAdapter] 종료")
         self._connected = False
 
@@ -108,7 +110,7 @@ class KiwoomAdapter:
     def get_cash(self) -> int:
         self.ensure_ready()
         if self.dry_run:
-            return self._cash
+            return int(self._cash)
         # TODO: Kiwoom 계좌조회 TR (ex: opw00001) 처리 후 반환
         self.logger.info("[KiwoomAdapter] REAL get_cash TODO")
         return 0
@@ -147,8 +149,12 @@ class KiwoomAdapter:
         if self.dry_run:
             oid = self._gen_order_id()
             fill_price = self._simulate_fill_price(symbol, price, order_type)
-            self._apply_fill(symbol, side, qty, fill_price)
-            self._orders[oid] = {
+            # 체결/현금/포지션 반영
+            try:
+                self._apply_fill(symbol, side, qty, fill_price)
+            except Exception as e:
+                return OrderResult(False, None, str(e))
+            od = {
                 "symbol": symbol,
                 "side": side,
                 "qty": qty,
@@ -157,8 +163,9 @@ class KiwoomAdapter:
                 "ts": time.time(),
                 "user_tag": user_tag,
             }
+            self._orders[oid] = od
             self.logger.info(f"[DRY_RUN] {side} {symbol} x{qty} @ {fill_price:.2f} → FILLED (oid={oid})")
-            return OrderResult(True, oid, "FILLED", raw=self._orders[oid])
+            return OrderResult(True, oid, "FILLED", raw=od)
         else:
             # TODO: Kiwoom SendOrder 파라미터 구성 및 호출
             # OnReceiveMsg/OnReceiveChejanData 이벤트로 결과 수신 → 상태 갱신
@@ -192,9 +199,9 @@ class KiwoomAdapter:
             return 10.0
         return float(price)
 
-    def _apply_fill(self, symbol: str, side: str, qty: int, price: float):
+    def _apply_fill(self, symbol: str, side: str, qty: int, price: float) -> None:
         if side == "BUY":
-            cost = int(price * qty)
+            cost = int(round(price * qty))
             if self._cash < cost:
                 raise RuntimeError("[DRY_RUN] not enough cash")
             self._cash -= cost
@@ -209,7 +216,7 @@ class KiwoomAdapter:
             pos = self._positions.get(symbol)
             if not pos or pos.qty < qty:
                 raise RuntimeError("[DRY_RUN] not enough position to sell")
-            self._cash += int(price * qty)
+            self._cash += int(round(price * qty))
             pos.qty -= qty
             if pos.qty == 0:
                 del self._positions[symbol]

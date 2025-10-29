@@ -14,12 +14,25 @@ from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 import time
+import os
 from collections import defaultdict
 
 from scoring.core import ScoreEngine
 from risk.core import RiskGate
 from order.router import OrderRouter
 from obs.log import get_logger
+
+# 섹터 유틸 (선택 기능)
+try:
+    from risk.utils.sector import (
+        load_sector_map,
+        attach_sector_map_to_portfolio,
+        compute_sector_exposure,
+        summarize_by_sector,
+    )
+    _SECTOR_UTILS_OK = True
+except Exception:
+    _SECTOR_UTILS_OK = False
 
 # (옵션) 보정기 직접 생성이 필요할 때 사용
 try:
@@ -64,6 +77,19 @@ class Hub:
         self.cooldown: defaultdict[str, int] = defaultdict(int)
         self.COOLDOWN_TICKS = 3
 
+        # 섹터 맵 로드 (있으면 사용, 없으면 빈맵)
+        self.sector_map: Dict[str, str] = {}
+        if _SECTOR_UTILS_OK:
+            try:
+                # 프로젝트 루트(data/sector_map.csv) 기준 경로
+                proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                sector_csv = os.path.join(proj_root, "data", "sector_map.csv")
+                self.sector_map = load_sector_map(sector_csv)
+                if self.sector_map:
+                    self.log.info(f"[Sector] loaded map: {len(self.sector_map)} symbols")
+            except Exception as e:
+                self.log.warning(f"[Sector] load failed: {e}")
+
         self.log.info(
             "HUB init: scorer=%s risk=%s router=%s",
             type(scorer).__name__,
@@ -97,7 +123,6 @@ class Hub:
     # --- 내부 포트폴리오 스냅샷 (RiskGate용) ---
     def _portfolio_snapshot(self) -> Dict[str, dict]:
         pf: Dict[str, dict] = {}
-        # pos/avg_px는 DRY_RUN에서 우리가 관리
         for s, q in self.pos.items():
             if q <= 0:
                 continue
@@ -142,8 +167,7 @@ class Hub:
         score = self.scorer.evaluate(snapshot)
         self.log.info("HUB score: %.3f", score)
 
-        # ② 기본 의사결정(스코어→액션) : 간단 매핑
-        #   * 점수>0 → BUY 후보, 점수<0 → SELL 후보, 0 → HOLD
+        # ② 기본 의사결정(스코어→액션)
         if score > 0:
             decision = {"action": "BUY", "symbol": sym, "qty": 0, "order_type": "MKT", "price": None, "tag": "score>0"}
         elif score < 0:
@@ -163,14 +187,33 @@ class Hub:
 
         # ③ RiskGate
         if hasattr(self.risk, "allow_entry") and hasattr(self.risk, "size_for"):
-            # 신규 API: BUY 진입만 통제하고 수량 산정
             if decision.get("action") == "BUY":
+                # (a) 포트폴리오 스냅샷
                 portfolio = self._portfolio_snapshot()
-                if not self.risk.allow_entry(sym, portfolio, price):
+
+                # (b) 섹터 컨텍스트 구성 (유효 시)
+                ctx: Dict[str, Any] = {"budget": getattr(self.risk, "budget", None)}
+                if _SECTOR_UTILS_OK:
+                    pf_with_sector = attach_sector_map_to_portfolio(portfolio, self.sector_map)
+                    sector_expo = compute_sector_exposure(
+                        pf_with_sector,
+                        live_prices=self.last_px,
+                        mode="conservative",
+                    )
+                    ctx["symbol_sector"] = self.sector_map
+                    ctx["sector_exposure"] = sector_expo
+                    # 로그 요약(선택)
+                    if sector_expo:
+                        self.log.info("[SectorExpo] %s", summarize_by_sector(sector_expo))
+                else:
+                    pf_with_sector = portfolio  # 유틸 없으면 그대로 사용
+
+                # (c) 진입 허용 & 수량 산정
+                if not self.risk.allow_entry(sym, pf_with_sector, price, ctx=ctx):
                     self.log.warning(f"[RISK BLOCK] entry denied for {sym}")
                     decision = {**decision, "action": "HOLD", "qty": 0, "tag": "risk_block"}
                 else:
-                    qty = self.risk.size_for(sym, price)
+                    qty = self.risk.size_for(sym, price, pf_with_sector, ctx=ctx)
                     if qty <= 0:
                         self.log.info(f"[RISK SIZE=0] {sym} skipped")
                         decision = {**decision, "action": "HOLD", "qty": 0, "tag": "risk_size0"}
@@ -178,7 +221,6 @@ class Hub:
                         decision = {**decision, "qty": int(qty)}
             # SELL 은 포지션 가드만 적용(위에서 처리)
         else:
-            # 레거시 API: risk.apply(score, snapshot) 등으로 전체 의사결정 위임
             decision = self._risk_apply_legacy(score, snapshot)
 
         self.log.info("HUB decision: %s", decision)
@@ -197,14 +239,11 @@ class Hub:
             old_qty = self.pos[sym]
             old_avg = self.avg_px[sym] if old_qty > 0 else 0.0
             new_qty = old_qty + qty
-            # 단순 가중평균으로 평단 갱신
             self.avg_px[sym] = ((old_avg * old_qty) + (price * qty)) / max(1, new_qty)
             self.pos[sym] = new_qty
             self.cooldown[sym] = self.COOLDOWN_TICKS
         elif act == "SELL" and qty > 0 and self.pos[sym] >= qty:
-            # 실현 손익 기록(보정기용)
             self._record_realized_pnl_if_any(sym, "SELL", qty, price)
-
             self.pos[sym] -= qty
             if self.pos[sym] == 0:
                 self.avg_px[sym] = 0.0
@@ -242,21 +281,19 @@ class HubTrade:
 
     def __init__(self, real_mode: bool = False, budget: Optional[float] = None, **kwargs):
         self.log = get_logger("hubtrade")
-        self.opts = _RunnerOpts(real_mode=real_mode, budget=budget, **{
-            k: kwargs[k] for k in [
-                "calibrator_enabled", "calib_lr", "calib_hist", "calib_clip", "note"
-            ] if k in kwargs
-        })
+        self.opts = _RunnerOpts(
+            real_mode=real_mode,
+            budget=budget,
+            **{k: kwargs[k] for k in ["calibrator_enabled", "calib_lr", "calib_hist", "calib_clip", "note"] if k in kwargs}
+        )
 
         # ① 의존성 준비 (프로젝트 실제 엔진이 없으면 더미로 fallback)
         scorer, risk = self._make_scorer_risk()
         router = self._make_router()
-
         self.hub = Hub(scorer, risk, router)
 
     # --- 구성 요소 생성 ---
     def _make_scorer_risk(self) -> Tuple[ScoreEngine, RiskGate]:
-        # ScoreEngine + (옵션) Calibrator 주입
         calibrator = None
         if self.opts.calibrator_enabled and Calibrator is not None:
             calibrator = Calibrator(lr=self.opts.calib_lr, hist=self.opts.calib_hist, clip=self.opts.calib_clip)
@@ -284,17 +321,33 @@ class HubTrade:
 
     def _make_router(self) -> OrderRouter:
         router = OrderRouter(get_logger("router"))
+        # ① 먼저 모드 설정
         try:
             if hasattr(router, "set_mode"):
                 mode = "REAL" if self.opts.real_mode else "DRY"
                 router.set_mode(mode, budget=self.opts.budget)
-        except Exception:
-            pass
+                self.log.info(f"router.set_mode({mode}) applied")
+        except Exception as e:
+            self.log.warning(f"router.set_mode 예외: {e}")
+
+        # ② 연결 시도
+        ok = False
         try:
             ok = router.connect()
             self.log.info("router.connect() -> %s", ok)
         except Exception as e:
             self.log.warning("router.connect 예외: %s (계속 진행)", e)
+
+        # ③ REAL 실패 시 DRY로 폴백
+        if not ok and self.opts.real_mode:
+            self.log.warning("[SAFE FALLBACK] REAL 연결 불가 → DRY_RUN으로 전환합니다.")
+            try:
+                router.set_mode("DRY", budget=self.opts.budget)
+                ok = router.connect()
+                self.log.info("router.connect(DRY) -> %s", ok)
+            except Exception as e:
+                self.log.error("fallback 연결 실패: %s", e)
+
         return router
 
     # --- 피드 호환 유틸 ---
@@ -371,3 +424,4 @@ if __name__ == "__main__":
     hubtrade = HubTrade(real_mode=False, budget=1_000_000, calibrator_enabled=True)
     out = hubtrade.run_session(["005930", "000660"], max_ticks=10)
     print("decision_out(last10):", out.get("decisions"))
+
