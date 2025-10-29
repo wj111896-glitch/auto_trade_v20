@@ -1,3 +1,6 @@
+# PROJECT MEMORY — auto_trade_v20
+
+업데이트: 2025-10-29
 \# PROJECT MEMORY — auto\_trade\_v20 (오부장 전용 요약)
 
 
@@ -114,3 +117,7 @@
 
 
 
+
+
+## 변경 이력
+- 2025-10-29 — test: memory auto update
