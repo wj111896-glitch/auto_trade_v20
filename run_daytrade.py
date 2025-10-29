@@ -1,21 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-run_daytrade.py — v1
+run_daytrade.py — v2 (Calibrator 옵션 전달 포함)
 자동으로 허브(HubTrade) 연결 + 일자별 로그 + CLI 인자 처리
 
-사용 예시 (Windows CMD/Powershell):
-    python run_daytrade.py --symbols 005930 000660 035420 --max-ticks 2000 --mode dry
-    python run_daytrade.py --symbols 005930 --max-ticks 5000 --mode real --note "오전 테스트"
+예시:
+  python run_daytrade.py --symbols 005930 000660 035420 --max-ticks 200 --mode dry
+  python run_daytrade.py --symbols 005930 --max-ticks 500 --mode real --note "오전 테스트"
+  python run_daytrade.py --symbols 005930 000660 035420 --max-ticks 500 --mode dry --budget 3000000 \
+      --use-calibrator --calib-lr 0.02 --calib-hist 100 --calib-clip 0.05
 
-필요 구성요소(존재하면 자동 사용 / 없으면 안전 대체):
-- common.config: DAYTRADE / REAL_MODE / BUDGET 등
-- obs.log.get_logger: 프로젝트용 로거 (없으면 기본 로거 사용)
-- hub.hub_trade.HubTrade: 거래 허브 (필수)
-
-로그 저장 경로:
-    logs/daytrade_YYYYMMDD.log
-세션 요약(간단):
-    logs/daytrade_YYYYMMDD.summary.json
+로그:
+  logs/daytrade_YYYYMMDD.log
+요약(JSON):
+  logs/daytrade_YYYYMMDD.summary.json
 """
 from __future__ import annotations
 import argparse
@@ -23,18 +20,18 @@ import json
 import os
 import sys
 import signal
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
+import logging
 
 # === ① 경로 세팅: 프로젝트 루트 기준 ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-# === ② 안전한 로거 준비 (obs.log 있으면 사용) ===
-import logging
 
+# === ② 안전한 로거 준비 (obs.log 있으면 사용) ===
 def _fallback_logger(name: str, log_file: str) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
@@ -85,9 +82,13 @@ def load_project_config(logger: logging.Logger) -> RunnerConfig:
     cfg = RunnerConfig()
     try:
         from common.config import DAYTRADE  # type: ignore
-        cfg.budget = getattr(DAYTRADE, 'BUDGET', None)
-        # 전역 REAL_MODE가 있을 수도 있음
-        cfg.real_mode = bool(getattr(DAYTRADE, 'REAL_MODE', False))
+        # dict 스타일/객체 스타일 모두 허용
+        if isinstance(DAYTRADE, dict):
+            cfg.budget = DAYTRADE.get('BUDGET')
+            cfg.real_mode = bool(DAYTRADE.get('REAL_MODE', False))
+        else:
+            cfg.budget = getattr(DAYTRADE, 'BUDGET', None)
+            cfg.real_mode = bool(getattr(DAYTRADE, 'REAL_MODE', False))
         logger.info(f"Loaded common.config.DAYTRADE (budget={cfg.budget}, real_mode={cfg.real_mode})")
     except Exception:
         logger.warning("common.config.DAYTRADE 를 찾을 수 없어 기본값으로 진행합니다.")
@@ -122,12 +123,10 @@ class HubAdapter:
                 self.logger.info("허브 실행: %s(symbols=%s, max_ticks=%s)", meth, symbols, max_ticks)
                 result = fn(symbols=symbols, max_ticks=max_ticks)  # type: ignore
                 return result if isinstance(result, dict) else {"result": str(result)}
-        # 메서드가 없다면 예외
         raise AttributeError("HubTrade에 실행 메서드(run_session/start/run)가 없습니다.")
 
 
 # === ⑤ CLI ===
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run daytrade hub runner")
     p.add_argument('--symbols', nargs='+', required=True, help='거래 심볼(코드) 리스트')
@@ -135,6 +134,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--mode', choices=['dry', 'real'], default=None, help='실행 모드 강제 지정')
     p.add_argument('--budget', type=float, default=None, help='총 예산(옵션)')
     p.add_argument('--note', type=str, default='', help='세션 메모')
+
+    # Calibrator 옵션 (허브로 전달)
+    p.add_argument("--use-calibrator", action="store_true", help="EMA 기반 온라인 보정 활성화")
+    p.add_argument("--calib-lr", type=float, default=0.02)
+    p.add_argument("--calib-hist", type=int, default=100)
+    p.add_argument("--calib-clip", type=float, default=0.05)
     return p.parse_args()
 
 
@@ -167,7 +172,6 @@ def main():
         cfg.real_mode = False
     elif args.mode == 'real':
         cfg.real_mode = True
-
     if args.budget is not None:
         cfg.budget = args.budget
 
@@ -175,8 +179,20 @@ def main():
     logger.info("symbols=%s, max_ticks=%s, real_mode=%s, budget=%s, note=%s",
                 args.symbols, args.max_ticks, cfg.real_mode, cfg.budget, args.note)
 
-    # 허브 초기화
-    hub = HubAdapter(logger).init(real_mode=cfg.real_mode, budget=cfg.budget)
+    # 허브 초기화 (Calibrator 설정도 함께 전달 — 허브/엔진에서 사용)
+    hub_kwargs = dict(
+        real_mode=cfg.real_mode,
+        budget=cfg.budget,
+        calibrator_enabled=args.use_calibrator,
+        calib_lr=args.calib_lr,
+        calib_hist=args.calib_hist,
+        calib_clip=args.calib_clip,
+        note=args.note,
+    )
+    if args.use_calibrator:
+        logger.info(f"[Calibrator] enabled lr={args.calib_lr} hist={args.calib_hist} clip={args.calib_clip}")
+
+    hub = HubAdapter(logger).init(**hub_kwargs)
 
     # 실행
     session_result: dict = {}
@@ -195,6 +211,12 @@ def main():
         "real_mode": cfg.real_mode,
         "budget": cfg.budget,
         "note": args.note,
+        "calibrator": {
+            "enabled": args.use_calibrator,
+            "lr": args.calib_lr,
+            "hist": args.calib_hist,
+            "clip": args.calib_clip,
+        },
         "result": session_result,
         "ended_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
