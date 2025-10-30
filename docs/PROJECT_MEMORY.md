@@ -121,3 +121,13 @@
 
 ## 변경 이력
 - 2025-10-29 — test: memory auto update
+
+## 📅 현재 상태 (2025-10-30)
+- 뉴스 자동화 파이프라인 점검 및 스케줄러 정상화 ✅
+- py -X utf8 -m tests.smoke_news OK
+- 스케줄러: NewsSummary_0805 (py 직접 호출로 수정)
+- 로그: news_logs\cron\news_8am.log 확인 (18:12)
+---
+
+
+
