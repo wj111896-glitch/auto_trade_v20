@@ -1,183 +1,186 @@
 # -*- coding: utf-8 -*-
-"""
-ExposurePolicy — 포트폴리오 노출(익스포저) 한도 점검 + 진입 수량 힌트
-
-인터페이스( RiskGate 호환 )
-- check_entry(symbol, price, portfolio, ctx) -> PolicyResult
-- size_hint(symbol, price, portfolio, ctx) -> Optional[int]
-
-ctx 기대 키
-- budget: float                      # 총 예산(원) — 없으면 params.budget 사용
-- sector_of: Callable[[str], str|None]  # 심볼→섹터 매핑(선택)
-- planned_qty: int                   # (선택) 이번 진입 예정 수량 — check_entry에 반영
-
-포트폴리오 포맷 예시
-{
-  "005930": {"qty": 100, "avg_px": 72000},
-  "000660": {"qty": 50,  "avg_px": 115000},
-}
-"""
+# risk/policies/exposure.py
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Callable
+import math
 
 from .base import BasePolicy, PolicyResult
 
-__all__ = ["ExposureParams", "ExposurePolicy"]
+
+__all__ = ["ExposureConfig", "ExposurePolicy"]
 
 
-# ================== Params ==================
+# ================== Config ==================
 @dataclass
-class ExposureParams:
-    """
-    노출(익스포저) 한도 파라미터
-    - max_total_exposure_pct : 총자산 대비 전체 보유 한도 (ex. 0.50 = 50%)
-    - per_symbol_cap_pct     : 종목당 보유 한도 (ex. 0.10 = 10%)
-    - per_sector_cap_pct     : 섹터당 보유 한도 (ex. 0.40 = 40%)  # sector_of 제공 시만 적용
-    - min_order_value        : 최소 주문금액(원) — size_hint에서 수량 산출 기준
-    - lot_size               : 수량 라운딩 단위
-    - budget                 : 기본 예산(원). ctx["budget"]가 오면 그 값으로 대체
-    """
-    max_total_exposure_pct: float = 1.0
-    per_symbol_cap_pct: float = 0.5
-    per_sector_cap_pct: float = 0.8
+class ExposureConfig:
+    """익스포저(노출) 한도 파라미터"""
+    # 자본 대비 한도
+    max_total_exposure_pct: float = 0.60    # 전체 포트폴리오 노출 한도 (예: 0.60 = 60%)
+    max_symbol_exposure_pct: float = 0.20   # 종목당 노출 한도 (예: 0.20 = 20%)
+    max_sector_exposure_pct: Optional[float] = None  # 섹터 한도 (없으면 미적용)
 
-    min_order_value: int = 20_000
-    lot_size: int = 1
-    budget: float = 10_000_000.0
+    # 사이징 관련
+    lot_size: int = 1                        # 최소 거래 단위(주)
+    min_order_value: int = 0                 # 최소 주문 금액(원). 0이면 제한 없음
+
+    # 컨텍스트 키
+    equity_key: str = "equity"               # ctx["account"][equity_key] 사용
 
 
 # ================== Policy ==================
 class ExposurePolicy(BasePolicy):
     """
-    포트폴리오 익스포저 한도를 점검하는 정책.
+    포트폴리오 익스포저(총/심볼/섹터) 한도를 점검하고, 남은 한도 기반의 size_hint를 제공합니다.
 
     BasePolicy 인터페이스:
       - check_entry(symbol, price, portfolio, ctx) -> PolicyResult
       - size_hint(symbol, price, portfolio, ctx) -> Optional[int]
+
+    ctx 기대 키:
+      - account: {"equity": float}                    # 필수(자본)
+      - planned_qty: int                              # 선택(이번 진입 예정 수량)
+      - sector_of: Callable[[str], Optional[str]]     # 선택(섹터명 매핑 함수)
     """
 
-    def __init__(self, params: Optional[ExposureParams] = None):
-        self.p = params or ExposureParams()
+    def __init__(self, cfg: Optional[ExposureConfig] = None):
+        self.cfg = cfg or ExposureConfig()
 
     # ---- helpers ---------------------------------------------------------
-    @staticmethod
-    def _pf_value(pf: Dict[str, dict]) -> float:
-        # 보유자산 평가액 합 (avg_px 기반, 보수적 용도면 size_hint에서 cap으로 조정)
-        return sum(float(v.get("qty", 0)) * float(v.get("avg_px", 0)) for v in (pf or {}).values())
+    def _equity(self, ctx: Dict[str, Any]) -> Optional[float]:
+        acct = (ctx or {}).get("account") or {}
+        eq = acct.get(self.cfg.equity_key)
+        return float(eq) if eq is not None else None
 
     @staticmethod
-    def _sym_value(pf: Dict[str, dict], sym: str, live_px: float) -> float:
-        pos = (pf or {}).get(sym)
-        if not pos:
-            return 0.0
-        qty = float(pos.get("qty", 0))
-        avg = float(pos.get("avg_px", 0))
-        base = max(avg, float(live_px))  # 보수적 평가(더 큰 가격 기준)
-        return qty * base
+    def _price_from_pos(pos: dict, live_px: Optional[float] = None) -> float:
+        """포지션 평가에 사용할 가격(보수적으로 mtm>avg>live 순서로 선택)."""
+        if pos is None:
+            return float(live_px or 0.0)
+        mtm = pos.get("mtm_price")
+        if mtm is not None:
+            return float(mtm)
+        avg = pos.get("avg_price") or pos.get("avg_px")
+        if avg is not None:
+            return float(avg)
+        return float(live_px or 0.0)
 
-    @staticmethod
-    def _sector_value(
+    def _position_value(self, pos: dict, live_px: Optional[float] = None) -> float:
+        qty = float((pos or {}).get("qty") or 0.0)
+        px = self._price_from_pos(pos, live_px)
+        return max(0.0, qty * px)
+
+    def _portfolio_value(self, pf: Dict[str, dict]) -> float:
+        return sum(self._position_value(pos) for pos in (pf or {}).values())
+
+    def _symbol_value(self, pf: Dict[str, dict], sym: str, live_px: float) -> float:
+        return self._position_value((pf or {}).get(sym), live_px)
+
+    def _sector_values(
+        self,
         pf: Dict[str, dict],
         sector_of: Callable[[str], Optional[str]],
-        live_prices: Dict[str, float],
     ) -> Dict[str, float]:
         """섹터별 현재 보유 평가금액 합계"""
-        sector_sum: Dict[str, float] = {}
+        by_sector: Dict[str, float] = {}
         for sym, pos in (pf or {}).items():
             sector = sector_of(sym) or "UNKNOWN"
-            qty = float(pos.get("qty", 0))
-            avg = float(pos.get("avg_px", 0))
-            px = float(live_prices.get(sym, avg))
-            base = max(avg, px)
-            sector_sum[sector] = sector_sum.get(sector, 0.0) + qty * base
-        return sector_sum
+            val = self._position_value(pos)  # pos 내부의 mtm/avg 기준
+            by_sector[sector] = by_sector.get(sector, 0.0) + val
+        return by_sector
 
-    # ---- policy checks ---------------------------------------------------
-    def check_entry(self, symbol: str, price: float, portfolio: Dict[str, dict], ctx: Dict[str, Any]) -> PolicyResult:
-        p = self.p
-        budget: float = float(ctx.get("budget") or p.budget)
-        planned_qty: int = int(ctx.get("planned_qty") or 0)
-        planned_value: float = max(float(price), 0.0) * max(planned_qty, 0)
+    # ---- core calc -------------------------------------------------------
+    def _remaining_values(
+        self,
+        symbol: str,
+        price: float,
+        portfolio: Dict[str, dict],
+        ctx: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """
+        총/심볼/섹터(옵션) 남은 한도를 원화 기준으로 계산해서 반환.
+        """
+        eq = self._equity(ctx) or 0.0
+        total_cap = eq * self.cfg.max_total_exposure_pct
+        symbol_cap = eq * self.cfg.max_symbol_exposure_pct
 
-        # 현재 노출 평가
-        total_val = self._pf_value(portfolio)
-        sym_val = self._sym_value(portfolio, symbol, float(price))
+        tot_val = self._portfolio_value(portfolio)
+        sym_val = self._symbol_value(portfolio, symbol, float(price))
 
-        # ① 총 노출 한도 (이번 진입 포함 가정 평가)
-        if (total_val + planned_value) > p.max_total_exposure_pct * budget:
-            return PolicyResult(False, "total_exposure_cap")
+        rem_total = max(0.0, total_cap - tot_val)
+        rem_symbol = max(0.0, symbol_cap - sym_val)
 
-        # ② 종목 한도
-        if (sym_val + planned_value) > p.per_symbol_cap_pct * budget:
-            return PolicyResult(False, "symbol_exposure_cap")
-
-        # ③ 섹터 한도 (sector_of 제공시에만)
-        sector_of: Optional[Callable[[str], Optional[str]]] = ctx.get("sector_of")
-        if callable(sector_of):
-            live_prices = {symbol: float(price)}  # 부족하면 avg_px로 대체하도록 _sector_value가 처리
-            sector_vals = self._sector_value(portfolio, sector_of, live_prices)
+        rem_sector = float("inf")
+        sector_of = ctx.get("sector_of")
+        if callable(sector_of) and self.cfg.max_sector_exposure_pct is not None:
             sector = sector_of(symbol) or "UNKNOWN"
-            sector_cur = float(sector_vals.get(sector, 0.0))
-            if (sector_cur + planned_value) > p.per_sector_cap_pct * budget:
-                return PolicyResult(False, "sector_exposure_cap")
+            by_sector = self._sector_values(portfolio, sector_of)
+            sector_cap = eq * float(self.cfg.max_sector_exposure_pct)
+            sector_now = float(by_sector.get(sector, 0.0))
+            rem_sector = max(0.0, sector_cap - sector_now)
 
-        return PolicyResult(True, "ok")
+        return {"total": rem_total, "symbol": rem_symbol, "sector": rem_sector}
 
-    # ---- sizing ----------------------------------------------------------
-    def size_hint(self, symbol: str, price: float, portfolio: Dict[str, dict], ctx: Dict[str, Any]) -> Optional[int]:
-        """
-        최소 주문금액 기반 기본 수량을 만든 뒤,
-        총/심볼/섹터 남은 한도에 맞춰 자동으로 '깎아'서 반환.
-        -> total_exposure_cap 때문에 막히던 진입을 수량 조절로 통과시킴.
-        """
-        price = float(price)
+    def _max_qty_from_remaining(self, remain_value: float, price: float) -> int:
         if price <= 0:
             return 0
-        p = self.p
-
-        # 0) 기본 수량(최소 주문금액 + lot_size)
-        base_qty = max(0, int(p.min_order_value // int(price)))
-        base_qty = (base_qty // p.lot_size) * p.lot_size
-        if base_qty == 0 and p.min_order_value <= price:
-            base_qty = p.lot_size
-
-        budget: float = float(ctx.get("budget") or p.budget)
-        sector_of = ctx.get("sector_of")
-
-        # 현재 노출
-        total_val = self._pf_value(portfolio)
-        sym_val   = self._sym_value(portfolio, symbol, price)
-
-        # 1) 총 한도 남은 여유(원) → 수량
-        max_total = p.max_total_exposure_pct * budget
-        head_total = max(0.0, max_total - total_val)
-        allow_by_total = int(head_total // price)
-
-        # 2) 종목 한도 남은 여유(원) → 수량
-        max_sym = p.per_symbol_cap_pct * budget
-        head_sym = max(0.0, max_sym - sym_val)
-        allow_by_symbol = int(head_sym // price)
-
-        # 3) 섹터 한도 남은 여유(있을 때만)
-        allow_by_sector = 10**9  # 사실상 무한
-        if callable(sector_of):
-            sector = sector_of(symbol) or "UNKNOWN"
-            # 섹터 현재 노출 합계
-            sec_cur = 0.0
-            for s, pos in (portfolio or {}).items():
-                if (sector_of(s) or "UNKNOWN") == sector:
-                    q = float(pos.get("qty", 0)); avg = float(pos.get("avg_px", 0))
-                    px = max(avg, price if s == symbol else avg)
-                    sec_cur += q * px
-            max_sec = p.per_sector_cap_pct * budget
-            head_sec = max(0.0, max_sec - sec_cur)
-            allow_by_sector = int(head_sec // price)
-
-        # 4) 한도 모두 만족하도록 수량 결정
-        qty = min(base_qty, allow_by_total, allow_by_symbol, allow_by_sector)
-
-        # lot_size 보정 및 하한
-        qty = (qty // p.lot_size) * p.lot_size
+        qty = int(math.floor(remain_value / float(price)))
+        # lot_size 정렬
+        lot = max(1, int(self.cfg.lot_size))
+        qty = (qty // lot) * lot
         return max(0, qty)
+
+    # ---- policy API ------------------------------------------------------
+    def check_entry(self, symbol: str, price: float, portfolio: Dict[str, dict], ctx: Dict[str, Any]) -> PolicyResult:
+        eq = self._equity(ctx)
+        if not eq or eq <= 0:
+            # 계좌 정보 없으면 정책 적용 불가 → 통과(로그만 남기는게 일반적)
+            return PolicyResult(allow=True, reason="exposure:ctx-missing")
+
+        remain = self._remaining_values(symbol, float(price), portfolio, ctx)
+
+        # planned_qty(선택)까지 고려해 하드 블록 여부 판단
+        planned_qty = int(ctx.get("planned_qty") or 0)
+        planned_val = max(0.0, float(price)) * max(0, planned_qty)
+
+        total_cap_ok = remain["total"] - planned_val > 0
+        symbol_cap_ok = remain["symbol"] - planned_val > 0
+        sector_cap_ok = True
+        if self.cfg.max_sector_exposure_pct is not None and callable(ctx.get("sector_of")):
+            sector_cap_ok = remain["sector"] - planned_val > 0
+
+        if not total_cap_ok:
+            return PolicyResult(False, f"exposure:block:total used={1 - remain['total']/ (eq*self.cfg.max_total_exposure_pct + 1e-9):.0%}")
+        if not symbol_cap_ok:
+            return PolicyResult(False, "exposure:block:symbol")
+        if not sector_cap_ok:
+            return PolicyResult(False, "exposure:block:sector")
+
+        # 통과 시에도 남은 한도 기반 최대 진입 수량 힌트 제공
+        effective_remain = min(remain["total"], remain["symbol"], remain["sector"])
+        max_qty = self._max_qty_from_remaining(effective_remain, float(price))
+
+        # 최소 주문금액 기준 하한(있다면)
+        if self.cfg.min_order_value > 0 and float(price) > 0:
+            min_qty = max(1, int(self.cfg.min_order_value // float(price)))
+            min_qty = (min_qty // max(1, self.cfg.lot_size)) * max(1, self.cfg.lot_size)
+            max_qty = max(max_qty, min_qty) if effective_remain >= self.cfg.min_order_value else max_qty
+
+        return PolicyResult(True, f"exposure:ok remain≈{effective_remain/eq:.0%}", max_qty_hint=max_qty)
+
+    def size_hint(self, symbol: str, price: float, portfolio: Dict[str, dict], ctx: Dict[str, Any]) -> Optional[int]:
+        """check_entry와 동일 로직으로 최대 진입 수량을 재계산하여 반환."""
+        eq = self._equity(ctx)
+        if not eq or eq <= 0:
+            return None
+        remain = self._remaining_values(symbol, float(price), portfolio, ctx)
+        effective_remain = min(remain["total"], remain["symbol"], remain["sector"])
+        max_qty = self._max_qty_from_remaining(effective_remain, float(price))
+
+        if self.cfg.min_order_value > 0 and float(price) > 0:
+            min_qty = max(1, int(self.cfg.min_order_value // float(price)))
+            min_qty = (min_qty // max(1, self.cfg.lot_size)) * max(1, self.cfg.lot_size)
+            max_qty = max(max_qty, min_qty) if effective_remain >= self.cfg.min_order_value else max_qty
+        return max_qty
 
