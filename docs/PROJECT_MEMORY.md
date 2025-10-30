@@ -1,6 +1,6 @@
 # PROJECT MEMORY — auto_trade_v20
 
-업데이트: 2025-10-29
+업데이트: 2025-10-31
 \# PROJECT MEMORY — auto\_trade\_v20 (오부장 전용 요약)
 
 
@@ -127,7 +127,22 @@
 - py -X utf8 -m tests.smoke_news OK
 - 스케줄러: NewsSummary_0805 (py 직접 호출로 수정)
 - 로그: news_logs\cron\news_8am.log 확인 (18:12)
----
 
+## 📅 2025-10-30 — DayDD 리스크 제어 기능 확장 완료
+
+### ✅ 주요 변경 사항
+- **risk/day_dd.py**: 실거래용 파라미터 (-2% / -1% / 15분 / 0.4) 래퍼 `make_daydd()` 추가  
+- **risk/policies/day_dd_policy.py**: soft-zone 축소, hard-cut 차단, 쿨다운 유지 로직 완성  
+- **risk/core.py**: RiskGate 자동 주입 (`make_daydd()`) + evaluate 병합 로그 출력  
+- **hub/hub_trade.py**: MTM 기반 `equity_now` 계산 → DayDD 컨텍스트 전달 구조 안정화  
+- **테스트 통과**:
+  - `tests/test_daydd_block.py` : 하드컷 차단 정상 (`daydd_hard`)  
+  - `tests/unit_daydd_soft_scale.py` : soft-zone 축소 정상  
+  - `tests/unit_daydd_cooldown.py` : 쿨다운 해제 정상  
+
+### 💡 향후 계획
+1. 수수료/세금 반영형 손익률 계산  
+2. 섹터·포트폴리오 기반 추가 리스크 정책  
+3. 리포트 요약 자동 저장 (daydd_session_summary.csv)
 
 
