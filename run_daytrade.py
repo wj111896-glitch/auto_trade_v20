@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 run_daytrade.py — v2 final
-허브(HubTrade) 연결 + 일자별 로그 + CLI 인자 처리 + Calibrator 옵션
+허브(HubTrade) 연결 + 일자별 로그 + CLI 인자 처리 + Calibrator 옵션 + 세션 리포트 CSV(+수수료/세금/FIFO)
 """
 from __future__ import annotations
 import argparse
@@ -11,6 +11,8 @@ import sys
 import signal
 from datetime import datetime
 from typing import List, Optional
+import csv
+from pathlib import Path
 
 # === ① 경로 세팅 ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +39,7 @@ def get_project_logger(name: str, log_file: str) -> logging.Logger:
     try:
         from obs.log import get_logger as project_get_logger  # type: ignore
         logger = project_get_logger(name)
+        # 파일핸들 없으면 추가
         for h in logger.handlers:
             if isinstance(h, logging.FileHandler):
                 break
@@ -59,12 +62,132 @@ def load_project_config(logger: logging.Logger) -> RunnerConfig:
     cfg = RunnerConfig()
     try:
         from common.config import DAYTRADE  # type: ignore
-        cfg.budget = getattr(DAYTRADE, 'BUDGET', None)
-        cfg.real_mode = bool(getattr(DAYTRADE, 'REAL_MODE', False))
+        # dict 또는 객체 모두 허용
+        if isinstance(DAYTRADE, dict):
+            cfg.budget = DAYTRADE.get("budget")
+            cfg.real_mode = bool(DAYTRADE.get("REAL_MODE", False))
+        else:
+            cfg.budget = getattr(DAYTRADE, "BUDGET", None)
+            cfg.real_mode = bool(getattr(DAYTRADE, "REAL_MODE", False))
         logger.info(f"Loaded common.config.DAYTRADE (budget={cfg.budget}, real_mode={cfg.real_mode})")
     except Exception:
         logger.warning("common.config.DAYTRADE 를 찾을 수 없어 기본값으로 진행합니다.")
     return cfg
+
+# === 리포트 작성 유틸(전역) ===
+def write_session_report(
+    decisions: List[dict],
+    logger: logging.Logger,
+    fee_bps_buy: float = 0.0,
+    fee_bps_sell: float = 0.0,
+    tax_bps_sell: float = 0.0,
+) -> str:
+    """
+    BUY/SELL를 FIFO로 매칭하여 실현손익을 계산하고 CSV로 저장.
+    - bps 단위 수수료/세금 반영 (1 bps = 0.01%)
+    - BUY 수수료는 원가에 포함, SELL 시 분배 차감
+    - SELL 수수료/거래세는 체결가치 기준 차감
+    """
+    try:
+        b2 = 1.0 / 10000.0  # bps → 비율
+        date_str = datetime.now().strftime("%Y%m%d")
+        out_dir = Path(BASE_DIR) / "logs" / "reports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"daytrade_{date_str}_report.csv"
+
+        cols = ["time","symbol","action","qty","price","reason","pnl_gross","fee_value","tax_value","pnl_net"]
+        now_ts = datetime.now().strftime("%H:%M:%S")
+
+        # 심볼별 FIFO 재고: 각 lot = {"qty": int, "price": float, "buy_fee": float}
+        inv: dict[str, list[dict]] = {}
+
+        with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+            wr = csv.DictWriter(f, fieldnames=cols)
+            wr.writeheader()
+
+            for d in decisions or []:
+                act = str(d.get("action", "")).upper()
+                if act not in ("BUY", "SELL"):
+                    continue
+
+                sym = str(d.get("symbol"))
+                qty = int(d.get("qty") or 0)
+                px  = float(d.get("price") or 0.0)
+                reason = d.get("reason")
+
+                if qty <= 0 or px <= 0:
+                    wr.writerow({
+                        "time": now_ts,"symbol": sym,"action": act,"qty": qty,"price": px,"reason": reason,
+                        "pnl_gross": "", "fee_value": "", "tax_value": "", "pnl_net": ""
+                    })
+                    continue
+
+                if act == "BUY":
+                    # 매수 수수료(원가 포함)
+                    buy_val = qty * px
+                    buy_fee = buy_val * (fee_bps_buy * b2)
+                    inv.setdefault(sym, []).append({"qty": qty, "price": px, "buy_fee": buy_fee})
+                    wr.writerow({
+                        "time": now_ts,"symbol": sym,"action": act,"qty": qty,"price": px,"reason": reason,
+                        "pnl_gross": "", "fee_value": round(buy_fee,2), "tax_value": "", "pnl_net": ""
+                    })
+                    continue
+
+                # SELL: FIFO 소진하며 실현손익
+                sell_val = qty * px
+                sell_fee = sell_val * (fee_bps_sell * b2)
+                sell_tax = sell_val * (tax_bps_sell * b2)
+
+                remain = qty
+                pnl_gross = 0.0
+                buy_fee_consumed = 0.0
+
+                lots = inv.get(sym, [])
+                while remain > 0 and lots:
+                    lot = lots[0]
+                    use = min(remain, lot["qty"])
+
+                    # 수수료 비례 차감량(현재 lot 잔량 기준)
+                    if lot["qty"] > 0:
+                        proportion = use / lot["qty"]
+                    else:
+                        proportion = 0.0
+                    fee_cons = float(lot.get("buy_fee", 0.0)) * proportion
+
+                    # 손익 및 수수료 소비 누적
+                    pnl_gross += (px - float(lot["price"])) * use
+                    buy_fee_consumed += fee_cons
+
+                    # lot 잔여 수수료/수량 업데이트 (← 핵심!)
+                    lot["buy_fee"] = max(0.0, float(lot.get("buy_fee", 0.0)) - fee_cons)
+                    lot["qty"] -= use
+                    remain -= use
+
+                    if lot["qty"] == 0:
+                        lots.pop(0)
+
+                # 남은 수량(음수 매도) 방어
+                if remain > 0:
+
+                    logger.warning(f"FIFO 부족: {sym} sell qty {qty} 중 {remain}는 미매칭 (재고 부족).")
+
+                fee_value = sell_fee + buy_fee_consumed
+                tax_value = sell_tax
+                pnl_net = pnl_gross - fee_value - tax_value
+
+                wr.writerow({
+                    "time": now_ts,"symbol": sym,"action": act,"qty": qty,"price": px,"reason": reason,
+                    "pnl_gross": round(pnl_gross,2),
+                    "fee_value": round(fee_value,2),
+                    "tax_value": round(tax_value,2),
+                    "pnl_net": round(pnl_net,2),
+                })
+
+        logger.info(f"세션 리포트 저장: {out_path}")
+        return str(out_path)
+    except Exception as e:
+        logger.warning(f"세션 리포트 작성 실패: {e}")
+        return ""
 
 # === ④ 허브 어댑터 ===
 class HubAdapter:
@@ -103,6 +226,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--calib-lr', type=float, default=0.02)
     p.add_argument('--calib-hist', type=int, default=100)
     p.add_argument('--calib-clip', type=float, default=0.05)
+    # Fees & Taxes (basis points: 1 bps = 0.01%)
+    p.add_argument('--fee-bps-buy', type=float, default=0.0, help='매수 수수료(bps, 기본 0)')
+    p.add_argument('--fee-bps-sell', type=float, default=0.0, help='매도 수수료(bps, 기본 0)')
+    p.add_argument('--tax-bps-sell', type=float, default=0.0, help='매도 거래세(bps, 기본 0)')
     return p.parse_args()
 
 # === ⑥ 실행 진입 ===
@@ -183,6 +310,19 @@ def main():
         logger.info("세션 요약 저장: %s", summary_path)
     except Exception as e:
         logger.warning("세션 요약 저장 실패: %s", e)
+
+    # CSV 리포트도 저장 (BUY/SELL만) — 수수료/거래세 반영
+    try:
+        decisions = session_result.get("decisions") or []
+        if isinstance(decisions, list):
+            _ = write_session_report(
+                decisions, logger,
+                fee_bps_buy=float(getattr(args, "fee_bps_buy", 0.0)),
+                fee_bps_sell=float(getattr(args, "fee_bps_sell", 0.0)),
+                tax_bps_sell=float(getattr(args, "tax_bps_sell", 0.0)),
+            )
+    except Exception as e:
+        logger.warning(f"세션 리포트 저장 예외: {e}")
 
     logger.info("=== DAYTRADE RUN END ===")
 

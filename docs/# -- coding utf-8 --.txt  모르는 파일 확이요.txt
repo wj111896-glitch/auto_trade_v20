@@ -1,0 +1,203 @@
+# -*- coding: utf-8 -*-
+"""
+DayDrawdownPolicy — 하루 누적 손실(손익률) 기반 진입 차단/스케일 다운/강제 청산 신호 제공
+
+⛳ 목적
+- 당일 손익이 설정 임계치(예: -2%)를 넘게 손실날 경우, 신규 진입을 차단(hold)하고 필요 시 전량 청산(force_flatten) 신호를 보냅니다.
+- 소프트 구간(예: -1% ~ -2%)에서는 포지션 사이즈를 축소(scale)하여 리스크를 낮춥니다.
+
+📦 입력/출력 프로토콜 (RiskGate와의 약속)
+- evaluate(context: Dict[str, Any]) -> Dict[str, Any]
+  context 필드 권장:
+    - "is_entry": bool           # True면 신규 진입, False면 청산/감소 등
+    - "day_start_equity": float  # 당일 시작 시점 계정 평가금액(분모)
+    - "equity": float            # 현재 계정 평가금액
+    - "realized_pnl": float      # 당일 누적 실현 손익 (옵션: 없으면 내부 상태 사용)
+    - "unrealized_pnl": float    # 현재 미실현 손익 (옵션)
+
+  반환 필드:
+    - "allow": bool              # 해당 정책 기준 신규 진입 허용 여부
+    - "scale": float             # 허용 시 포지션 사이즈 배율 (0.0~1.0)
+    - "reason": str              # 결정 사유 (로깅용)
+    - "force_flatten": bool      # 강제 청산 권고 (Gate가 최종 판단)
+
+🗂️ 상태 저장
+- 하루 단위로 파일에 realized_pnl을 기록하여 프로세스 재시작에도 유지합니다.
+- 경로 기본값: state/day_dd_YYYYMMDD.json
+
+사용 예시 (RiskGate 내부 혹은 주입부)
+    dd = DayDrawdownPolicy(limit_pct=-0.02, soft_pct=-0.01, scale_min=0.3)
+    out = dd.evaluate({
+        "is_entry": True,
+        "day_start_equity": 100_000_000,
+        "equity": 99_100_000,
+    })
+
+작성: 2025-10-30
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
+import os
+import json
+from datetime import datetime
+
+
+# ===== Config dataclass ======================================================
+@dataclass
+class DayDDConfig:
+    limit_pct: float = -0.02      # 하드 컷: 이 값 이하로 내려가면 신규진입 금지 + 강제청산 권고
+    soft_pct: float = -0.01       # 소프트 구간 시작: 이 값 이하로 내려가면 scale 적용
+    scale_min: float = 0.3        # 소프트 구간 하단에서 적용할 최소 배율 (soft~limit 선형 보간)
+    use_unrealized: bool = False  # 손익률 계산에 미실현 포함 여부
+    state_dir: str = os.path.join("state")
+
+
+# ===== Implementation ========================================================
+class DayDrawdownPolicy:
+    def __init__(self, limit_pct: float = -0.02, soft_pct: float = -0.01,
+                 scale_min: float = 0.3, use_unrealized: bool = False,
+                 state_dir: Optional[str] = None) -> None:
+        self.cfg = DayDDConfig(
+            limit_pct=limit_pct, soft_pct=soft_pct,
+            scale_min=scale_min, use_unrealized=use_unrealized,
+            state_dir=state_dir or "state",
+        )
+        os.makedirs(self.cfg.state_dir, exist_ok=True)
+        self._day = self._today()
+        self._realized_pnl = self._load_state()  # 당일 누적 실현 손익
+
+    # --- public api ---------------------------------------------------------
+    def evaluate(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """핵심 판단 로직. RiskGate가 매 tick/주문 전 호출.
+        context에서 다음을 우선 사용하되, 없으면 내부 상태/보수적 가정 사용.
+        """
+        self._roll_day_if_needed()
+
+        is_entry = bool(context.get("is_entry", True))
+        day_start_equity = float(context.get("day_start_equity", 0.0))
+        equity = float(context.get("equity", 0.0))
+
+        # 손익 추정: 우선순위 realized_pnl(context) > 내부상태 > equity - day_start
+        realized_ctx = context.get("realized_pnl")
+        realized = float(realized_ctx) if realized_ctx is not None else self._realized_pnl
+
+        unreal = float(context.get("unrealized_pnl", 0.0)) if self.cfg.use_unrealized else 0.0
+
+        # 분모가 없으면 보수적으로 신규 진입을 막지 않되(운용 가능), 메시지 남김
+        if day_start_equity <= 0:
+            return {
+                "allow": True,
+                "scale": 1.0,
+                "reason": "DayDD: day_start_equity=0 (분모 불명). 정책 미적용.",
+                "force_flatten": False,
+            }
+
+        # day PnL = realized + (opt) unrealized, 분모는 day_start_equity
+        day_pnl = realized + unreal if self.cfg.use_unrealized else realized
+        day_pnl_pct = day_pnl / day_start_equity
+
+        # 1) 하드 컷: 신규 진입 차단 + 강제청산 권고(진입 요청 시)
+        if day_pnl_pct <= self.cfg.limit_pct:
+            if is_entry:
+                return {
+                    "allow": False,
+                    "scale": 0.0,
+                    "reason": f"DayDD HARD-CUT: {day_pnl_pct:.3%} ≤ {self.cfg.limit_pct:.2%}",
+                    "force_flatten": True,
+                }
+            else:
+                # 청산/감소는 항상 허용
+                return {
+                    "allow": True,
+                    "scale": 1.0,
+                    "reason": f"DayDD HARD-CUT(active): exit allowed (day {day_pnl_pct:.3%})",
+                    "force_flatten": True,
+                }
+
+        # 2) 소프트 구간: 선형 스케일링 (soft_pct ~ limit_pct 사이)
+        if day_pnl_pct <= self.cfg.soft_pct:
+            scale = self._linear_scale(day_pnl_pct, self.cfg.soft_pct, self.cfg.limit_pct,
+                                       1.0, self.cfg.scale_min)
+            if is_entry:
+                return {
+                    "allow": True,
+                    "scale": max(self.cfg.scale_min, min(1.0, scale)),
+                    "reason": f"DayDD SOFT-ZONE: {day_pnl_pct:.3%} ≤ {self.cfg.soft_pct:.2%} → scale {scale:.2f}",
+                    "force_flatten": False,
+                }
+            else:
+                return {
+                    "allow": True,
+                    "scale": 1.0,
+                    "reason": f"DayDD SOFT(active): exit allowed (day {day_pnl_pct:.3%})",
+                    "force_flatten": False,
+                }
+
+        # 3) 정상 구간: 풀 허용
+        return {
+            "allow": True,
+            "scale": 1.0,
+            "reason": f"DayDD OK: day {day_pnl_pct:.3%}",
+            "force_flatten": False,
+        }
+
+    def record_fill(self, realized_pnl_delta: float) -> None:
+        """체결 시점에 실현 손익 변화를 전달받아 내부 상태를 업데이트.
+        ex) 매수 체결 수수료는 보통 0에 가깝고, 매도 체결 시 realized PnL 확정.
+        주문 라우터/포지션 매니저에서 호출하세요.
+        """
+        self._roll_day_if_needed()
+        self._realized_pnl += float(realized_pnl_delta)
+        self._save_state()
+
+    # --- helpers ------------------------------------------------------------
+    @staticmethod
+    def _today() -> str:
+        return datetime.now().strftime("%Y%m%d")
+
+    def _state_path(self) -> str:
+        return os.path.join(self.cfg.state_dir, f"day_dd_{self._day}.json")
+
+    def _load_state(self) -> float:
+        try:
+            with open(self._state_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return float(data.get("realized_pnl", 0.0))
+        except FileNotFoundError:
+            return 0.0
+        except Exception:
+            return 0.0
+
+    def _save_state(self) -> None:
+        data = {
+            "day": self._day,
+            "realized_pnl": self._realized_pnl,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            with open(self._state_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _roll_day_if_needed(self) -> None:
+        today = self._today()
+        if today != self._day:
+            # 날짜 변경 → 상태 리셋
+            self._day = today
+            self._realized_pnl = 0.0
+            self._save_state()
+
+    @staticmethod
+    def _linear_scale(x: float, x1: float, x2: float, y1: float, y2: float) -> float:
+        """x1(soft)~x2(limit) 범위에서 y1~y2로 선형 보간.
+        x2 < x1 (예: -2% < -1%) 조건이므로 분모가 음수. 보간 결과는 0~1 사이로 클램프 권장.
+        """
+        if x <= x2:
+            return y2
+        if x >= x1:
+            return y1
+        # 선형 보간
+        t = (x - x1) / (x2 - x1)
+        return y1 + t * (y2 - y1)

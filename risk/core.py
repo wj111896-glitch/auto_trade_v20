@@ -1,19 +1,18 @@
 ﻿# -*- coding: utf-8 -*-
 """
-risk/core.py — RiskGate (policies orchestrator, adaptive sizing)
+risk/core.py — RiskGate (policies orchestrator)
 
-- 단일 RiskGate 정의(중복 제거)
-- evaluate(): 확장형 정책(evaluate) 병합 집계 (allow/scale/force_flatten)
-- 구 스타일(check_entry/size_hint) 정책도 어댑터로 지원
-- on_fill_realized(): 체결 손익을 DayDD 등에 전달(record_fill)
-- size_for(): 모든 정책의 size_hint를 모아 보수적(최소) 수량 채택
-- apply(): 레거시 호환 (score → BUY/HOLD/SELL)
+- evaluate(): 각 정책 결과 병합 (allow/scale/force_flatten/reason)
+- allow_entry()/size_for(): 구 정책 어댑터
+- check(): Hub 호환 (allow, reason, size_hint) 반환
+- on_fill_realized(): 체결 손익을 정책에 전달(record_fill)
+- apply(): 레거시 호환
 """
 from __future__ import annotations
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 
-# ---------- logger (fallback) ----------
+# ---------- logger fallback ----------
 try:
     from obs.log import get_logger  # type: ignore
 except Exception:
@@ -26,13 +25,6 @@ except Exception:
 
 log = get_logger("risk")
 
-# ---------- budget 기본값 ----------
-try:
-    from common import config  # type: ignore
-    _BUDGET = float(getattr(config, "BUDGET", 0.0) or 0.0)
-except Exception:
-    _BUDGET = 0.0
-
 # ---------- 정책 import ----------
 try:
     from .policies.base import BasePolicy as Policy, PolicyResult  # type: ignore
@@ -41,12 +33,22 @@ except Exception:
         pass
     @dataclass
     class PolicyResult:  # type: ignore
-        ok: bool
-        reason: Optional[str] = None
+        allow: bool
+        reason: str = ""
+        max_qty_hint: Optional[int] = None
 
-from .policies.exposure import ExposurePolicy, ExposureParams  # type: ignore
+# 노출(익스포저)
+from .policies.exposure import ExposurePolicy, ExposureConfig  # type: ignore
 
-# DayDD는 “랩퍼”를 통해 주입 (risk/day_dd.py의 make_daydd)
+# DayDD (있으면 사용)
+DayDDPolicy = None
+try:
+    from .policies.day_dd import DayDDPolicy as _DD  # type: ignore
+    DayDDPolicy = _DD
+except Exception:
+    DayDDPolicy = None
+
+# (선택) 별도 래퍼가 있는 프로젝트도 지원
 try:
     from .day_dd import make_daydd  # type: ignore
 except Exception:
@@ -54,8 +56,9 @@ except Exception:
 
 
 # ---------- 유틸 ----------
-def _norm_policy_output(res: Any) -> Dict[str, Any]:
-    """다양한 정책 출력을 표준 dict로 정규화.
+def _norm(res: Any) -> Dict[str, Any]:
+    """
+    다양한 정책 출력을 표준 dict로 정규화.
     표준 키: allow(bool), scale(float), force_flatten(bool), reason(str)
     """
     out = {"allow": True, "scale": 1.0, "force_flatten": False, "reason": None}
@@ -68,44 +71,61 @@ def _norm_policy_output(res: Any) -> Dict[str, Any]:
         out["reason"] = str(r) if r is not None else None
         return out
 
-    if hasattr(res, "ok") or hasattr(res, "allow"):  # PolicyResult 호환
-        ok = getattr(res, "ok", None)
-        if ok is None:
-            ok = getattr(res, "allow", True)
+    # PolicyResult 호환
+    if hasattr(res, "allow") or hasattr(res, "ok"):
+        ok = getattr(res, "allow", getattr(res, "ok", True))
         out["allow"] = bool(ok)
         out["reason"] = getattr(res, "reason", None)
         return out
 
-    out["allow"] = bool(res)  # truthy 최후 처리
+    # truthy fallback
+    out["allow"] = bool(res)
     return out
 
 
 # ======================== RiskGate ========================
 class RiskGate:
     """
-    Primary API:
+    Primary:
       - evaluate(context) -> {allow, scale, force_flatten, reason}
 
-    Adapter API (구 정책 호환):
+    Adapter:
       - allow_entry(symbol, portfolio, price, ctx=None) -> bool
       - size_for(symbol, price, portfolio, ctx=None) -> int
+
+    Hub 호환:
+      - check(symbol, price, portfolio, ctx=None) -> (allow, reason, size_hint)
 
     Legacy:
       - apply(score, snapshot) -> decision(dict)
     """
-    def __init__(self, policies: Optional[List[Policy]] = None, budget: Optional[float] = None) -> None:
-        self.budget = float(budget or _BUDGET or 10_000_000.0)
 
+    def __init__(self, policies: Optional[List[Policy]] = None, budget: Optional[float] = None) -> None:
+        self.budget = budget
         if policies is None:
-            policies = [ExposurePolicy(ExposureParams(budget=self.budget))]
-            # DayDD 랩퍼가 있으면 실거래 파라미터로 자동 주입
+            pols: List[Policy] = []
+
+            # DayDD 우선 (있을 때만)
             if make_daydd is not None:
                 try:
-                    policies.append(make_daydd())
+                    pols.append(make_daydd())  # 프로젝트별 래퍼 우선
                 except Exception as e:
                     log.warning(f"[RiskGate] make_daydd() 실패: {e}")
+            elif DayDDPolicy is not None:
+                try:
+                    pols.append(DayDDPolicy())  # 기본 정책
+                except Exception as e:
+                    log.warning(f"[RiskGate] DayDDPolicy 생성 실패: {e}")
 
-        self.policies: List[Policy] = policies
+            # Exposure 기본 주입
+            try:
+                pols.append(ExposurePolicy(ExposureConfig()))
+            except Exception as e:
+                log.warning(f"[RiskGate] ExposurePolicy 생성 실패: {e}")
+
+            self.policies = pols
+        else:
+            self.policies = policies
 
     # ---------- 공통 컨텍스트 병합 ----------
     @staticmethod
@@ -122,12 +142,12 @@ class RiskGate:
         for p in self.policies:
             try:
                 if hasattr(p, "evaluate"):
-                    res = _norm_policy_output(p.evaluate(context))  # type: ignore
+                    res = _norm(p.evaluate(context))  # type: ignore
                 elif hasattr(p, "check_entry"):  # 구 스타일
                     sym = context.get("symbol") or context.get("sym") or "NA"
                     price = float(context.get("price", 0.0) or 0.0)
                     pf = context.get("portfolio") or {}
-                    res = _norm_policy_output(p.check_entry(sym, price, pf, context))  # type: ignore
+                    res = _norm(p.check_entry(sym, price, pf, context))  # type: ignore
                 else:
                     continue
             except Exception as e:
@@ -148,7 +168,7 @@ class RiskGate:
             "reason": " | ".join(reasons) if reasons else None,
         }
         log.info(
-            f"[RiskGate] allow={out['allow']} scale={out['scale']} "
+            f"[RiskGate] allow={out['allow']} scale={out['scale']:.2f} "
             f"force_flatten={out['force_flatten']} reason={out['reason']}"
         )
         return out
@@ -163,7 +183,7 @@ class RiskGate:
                 log.warning(f"[RiskGate] on_fill_realized error {p.__class__.__name__}: {e}")
 
     # ---------- 어댑터: 구 정책 호환 ----------
-    def allow_entry(self, symbol: str, portfolio: Dict[str, dict], price: float,
+    def allow_entry(self, symbol: str, price: float, portfolio: Dict[str, dict],
                     ctx: Optional[Dict[str, Any]] = None) -> bool:
         cx = self._merge_ctx(ctx)
         ev = self.evaluate({**cx, "is_entry": True, "symbol": symbol, "price": price, "portfolio": portfolio})
@@ -189,16 +209,48 @@ class RiskGate:
         # fallback: evaluate의 scale 이용
         ev = self.evaluate({**cx, "is_entry": True, "symbol": symbol, "price": price, "portfolio": portfolio})
         scale = float(ev.get("scale", 1.0))
-        base_qty = 1  # 필요시 config로 이동/계산
+        base_qty = 1  # 필요시 설정화
         qty = int(max(0, round(base_qty * scale)))
         log.info(f"[RiskGate] SIZE (fallback) scale={scale:.2f} -> qty={qty}")
         return qty
+
+    # ---------- Hub 호환 ----------
+    def check(self, symbol: str, price: float, portfolio: Dict[str, dict],
+              ctx: Optional[Dict[str, Any]] = None) -> Tuple[bool, str, Optional[int]]:
+        """
+        Hub에서 사용하는 인터페이스:
+        (allow: bool, reason: str, size_hint: Optional[int])
+        """
+        cx = self._merge_ctx(ctx)
+        ev = self.evaluate({**cx, "is_entry": True, "symbol": symbol, "price": price, "portfolio": portfolio})
+        allow = bool(ev.get("allow", True))
+        reason = str(ev.get("reason") or "ok")
+
+        # size_hint 수집
+        hints: List[int] = []
+        for p in self.policies:
+            if hasattr(p, "size_hint"):
+                try:
+                    q = p.size_hint(symbol, price, portfolio, cx)  # type: ignore
+                    if q is not None and int(q) >= 0:
+                        hints.append(int(q))
+                except Exception as e:
+                    log.warning(f"[RiskGate] size_hint error {p.__class__.__name__}: {e}")
+
+        size_hint = None
+        if hints:
+            # 0도 힌트로 들어올 수 있으니 음수만 제외하고 최소값 채택
+            hints = [int(q) for q in hints if q is not None and q >= 0]
+            if hints:
+                size_hint = min(hints)
+
+        return allow, reason, size_hint
 
     # ---------- 레거시 ----------
     def apply(self, score: float, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         sym = str(snapshot.get("symbol", "NA"))
         price = float(snapshot.get("price", 0.0) or 0.0)
-        pf = snapshot.get("_portfolio", {})
+        pf = snapshot.get("_portfolio", {}) or {}
 
         if score > 0:
             ev = self.evaluate({"is_entry": True, "symbol": sym, "price": price, "portfolio": pf, **snapshot})
