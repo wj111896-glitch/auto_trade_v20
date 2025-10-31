@@ -10,18 +10,22 @@ import os
 import sys
 import signal
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Iterable, Dict
 import csv
 from pathlib import Path
+import logging
+import time
 
 # === ① 경로 세팅 ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-# === ② 로거 ===
-import logging
+# 외부 모듈
+from scoring.rules.exit_rules import ExitRules
 
+
+# === ② 로거 ===
 def _fallback_logger(name: str, log_file: str) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
@@ -52,6 +56,7 @@ def get_project_logger(name: str, log_file: str) -> logging.Logger:
     except Exception:
         return _fallback_logger(name, log_file)
 
+
 # === ③ 설정 로딩 ===
 class RunnerConfig:
     def __init__(self):
@@ -62,7 +67,6 @@ def load_project_config(logger: logging.Logger) -> RunnerConfig:
     cfg = RunnerConfig()
     try:
         from common.config import DAYTRADE  # type: ignore
-        # dict 또는 객체 모두 허용
         if isinstance(DAYTRADE, dict):
             cfg.budget = DAYTRADE.get("budget")
             cfg.real_mode = bool(DAYTRADE.get("REAL_MODE", False))
@@ -74,7 +78,8 @@ def load_project_config(logger: logging.Logger) -> RunnerConfig:
         logger.warning("common.config.DAYTRADE 를 찾을 수 없어 기본값으로 진행합니다.")
     return cfg
 
-# === 리포트 작성 유틸(전역) ===
+
+# === ④ 리포트 작성 유틸(전역) ===
 def write_session_report(
     decisions: List[dict],
     logger: logging.Logger,
@@ -98,8 +103,7 @@ def write_session_report(
         cols = ["time","symbol","action","qty","price","reason","pnl_gross","fee_value","tax_value","pnl_net"]
         now_ts = datetime.now().strftime("%H:%M:%S")
 
-        # 심볼별 FIFO 재고: 각 lot = {"qty": int, "price": float, "buy_fee": float}
-        inv: dict[str, list[dict]] = {}
+        inv: Dict[str, List[dict]] = {}
 
         with out_path.open("w", newline="", encoding="utf-8-sig") as f:
             wr = csv.DictWriter(f, fieldnames=cols)
@@ -116,24 +120,19 @@ def write_session_report(
                 reason = d.get("reason")
 
                 if qty <= 0 or px <= 0:
-                    wr.writerow({
-                        "time": now_ts,"symbol": sym,"action": act,"qty": qty,"price": px,"reason": reason,
-                        "pnl_gross": "", "fee_value": "", "tax_value": "", "pnl_net": ""
-                    })
+                    wr.writerow({"time": now_ts,"symbol": sym,"action": act,"qty": qty,"price": px,"reason": reason,
+                                 "pnl_gross": "", "fee_value": "", "tax_value": "", "pnl_net": ""})
                     continue
 
                 if act == "BUY":
-                    # 매수 수수료(원가 포함)
                     buy_val = qty * px
                     buy_fee = buy_val * (fee_bps_buy * b2)
                     inv.setdefault(sym, []).append({"qty": qty, "price": px, "buy_fee": buy_fee})
-                    wr.writerow({
-                        "time": now_ts,"symbol": sym,"action": act,"qty": qty,"price": px,"reason": reason,
-                        "pnl_gross": "", "fee_value": round(buy_fee,2), "tax_value": "", "pnl_net": ""
-                    })
+                    wr.writerow({"time": now_ts,"symbol": sym,"action": act,"qty": qty,"price": px,"reason": reason,
+                                 "pnl_gross": "", "fee_value": round(buy_fee,2), "tax_value": "", "pnl_net": ""})
                     continue
 
-                # SELL: FIFO 소진하며 실현손익
+                # SELL: FIFO 소진
                 sell_val = qty * px
                 sell_fee = sell_val * (fee_bps_sell * b2)
                 sell_tax = sell_val * (tax_bps_sell * b2)
@@ -146,42 +145,28 @@ def write_session_report(
                 while remain > 0 and lots:
                     lot = lots[0]
                     use = min(remain, lot["qty"])
-
-                    # 수수료 비례 차감량(현재 lot 잔량 기준)
-                    if lot["qty"] > 0:
-                        proportion = use / lot["qty"]
-                    else:
-                        proportion = 0.0
+                    proportion = (use / lot["qty"]) if lot["qty"] > 0 else 0.0
                     fee_cons = float(lot.get("buy_fee", 0.0)) * proportion
 
-                    # 손익 및 수수료 소비 누적
                     pnl_gross += (px - float(lot["price"])) * use
                     buy_fee_consumed += fee_cons
 
-                    # lot 잔여 수수료/수량 업데이트 (← 핵심!)
                     lot["buy_fee"] = max(0.0, float(lot.get("buy_fee", 0.0)) - fee_cons)
                     lot["qty"] -= use
                     remain -= use
-
                     if lot["qty"] == 0:
                         lots.pop(0)
 
-                # 남은 수량(음수 매도) 방어
                 if remain > 0:
-
-                    logger.warning(f"FIFO 부족: {sym} sell qty {qty} 중 {remain}는 미매칭 (재고 부족).")
+                    logger.warning(f"FIFO 부족: {sym} sell qty {qty} 중 {remain} 미매칭(재고 부족).")
 
                 fee_value = sell_fee + buy_fee_consumed
                 tax_value = sell_tax
                 pnl_net = pnl_gross - fee_value - tax_value
 
-                wr.writerow({
-                    "time": now_ts,"symbol": sym,"action": act,"qty": qty,"price": px,"reason": reason,
-                    "pnl_gross": round(pnl_gross,2),
-                    "fee_value": round(fee_value,2),
-                    "tax_value": round(tax_value,2),
-                    "pnl_net": round(pnl_net,2),
-                })
+                wr.writerow({"time": now_ts,"symbol": sym,"action": act,"qty": qty,"price": px,"reason": reason,
+                             "pnl_gross": round(pnl_gross,2), "fee_value": round(fee_value,2),
+                             "tax_value": round(tax_value,2), "pnl_net": round(pnl_net,2)})
 
         logger.info(f"세션 리포트 저장: {out_path}")
         return str(out_path)
@@ -189,7 +174,26 @@ def write_session_report(
         logger.warning(f"세션 리포트 작성 실패: {e}")
         return ""
 
-# === ④ 허브 어댑터 ===
+
+# === ⑤ 간이 DRY-RUN 가격 피드 (없을 때만 사용) ===
+def make_price_feed(symbols: List[str], max_ticks: int) -> Iterable[Dict[str, float]]:
+    """
+    매우 단순한 데모 피드:
+    - 첫 2틱: 완만히 상승
+    - 3틱: 고점 형성
+    - 4틱: 급락 → trailing_stop 트리거 가능
+    """
+    base = 100.0
+    pattern = [0.0, 1.0, 2.5, -3.3]  # %
+    for i in range(min(max_ticks, len(pattern))):
+        snap = {}
+        for s in symbols:
+            snap[s] = round(base * (1.0 + pattern[i] / 100.0), 3)
+        yield snap
+        time.sleep(0.001)
+
+
+# === ⑥ 허브 어댑터 ===
 class HubAdapter:
     def __init__(self, logger: logging.Logger):
         self.logger = logger
@@ -198,27 +202,26 @@ class HubAdapter:
         self.hub = None
 
     def init(self, **kwargs):
-        self.logger.info("HubTrade 초기화 중... kwargs=%s", kwargs)
+        self.logger.info("HubTrade 초기화 중... kwargs=%s", {k: v for k, v in kwargs.items() if k != 'exit_rules'})
         self.hub = self.hub_cls(**kwargs)
         return self
 
     def run(self, symbols: List[str], max_ticks: int) -> dict:
         if self.hub is None:
             raise RuntimeError("Hub not initialized")
-        for meth in ("run_session", "start", "run"):
-            if hasattr(self.hub, meth):
-                fn = getattr(self.hub, meth)
-                self.logger.info("허브 실행: %s(symbols=%s, max_ticks=%s)", meth, symbols, max_ticks)
-                result = fn(symbols=symbols, max_ticks=max_ticks)  # type: ignore
-                return result if isinstance(result, dict) else {"result": str(result)}
-        raise AttributeError("HubTrade에 실행 메서드(run_session/start/run)가 없습니다.")
+        # HubTrade.run_session(price_feed_iter, max_ticks) 시그니처에 맞춰 호출
+        feed = make_price_feed(symbols, max_ticks)
+        result = self.hub.run_session(price_feed_iter=feed, max_ticks=max_ticks)
+        return {"result": str(result), "decisions": []}  # 필요 시 Hub에서 결정 로그 수집하도록 확장
 
-# === ⑤ CLI ===
+
+# === ⑦ CLI ===
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run daytrade hub runner")
     p.add_argument('--symbols', nargs='+', required=True, help='거래 심볼(코드) 리스트')
     p.add_argument('--max-ticks', type=int, default=2000, help='세션 최대 틱 수(기본 2000)')
-    p.add_argument('--mode', choices=['dry','real'], default=None, help='실행 모드 강제 지정')
+    p.add_argument('--dry', action='store_true', help='DRY_RUN(모의) 모드로 실행')
+    p.add_argument('--real', action='store_true', help='REAL(실계좌) 모드로 실행')
     p.add_argument('--budget', type=float, default=None, help='총 예산(옵션)')
     p.add_argument('--note', type=str, default='', help='세션 메모')
     # Calibrator
@@ -232,7 +235,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--tax-bps-sell', type=float, default=0.0, help='매도 거래세(bps, 기본 0)')
     return p.parse_args()
 
-# === ⑥ 실행 진입 ===
+
+# === ⑧ 실행 진입 ===
 RUN_FLAG = {"alive": True}
 def _install_signal_handlers(logger: logging.Logger):
     def _handler(signum, frame):
@@ -243,6 +247,7 @@ def _install_signal_handlers(logger: logging.Logger):
             signal.signal(s, _handler)
         except Exception:
             pass
+
 
 def main():
     today = datetime.now().strftime('%Y%m%d')
@@ -255,26 +260,24 @@ def main():
 
     # 설정 적용 (config -> CLI override)
     cfg = load_project_config(logger)
-    if args.mode == 'dry':
+    if getattr(args, "dry", False):
         cfg.real_mode = False
-    elif args.mode == 'real':
+    elif getattr(args, "real", False):
         cfg.real_mode = True
-    if args.budget is not None:
+    if args.budget is not None:     
         cfg.budget = args.budget
 
     logger.info("=== DAYTRADE RUN START ===")
     logger.info("symbols=%s, max_ticks=%s, real_mode=%s, budget=%s, note=%s",
                 args.symbols, args.max_ticks, cfg.real_mode, cfg.budget, args.note)
 
-    # 허브 초기화
+    # 허브 초기화 (ExitRules는 여기서 주입)
+    exit_rules = ExitRules()
     hub = HubAdapter(logger).init(
-        real_mode=cfg.real_mode,
-        budget=cfg.budget,
-        calibrator_enabled=bool(args.use_calibrator),
-        calib_lr=args.calib_lr,
-        calib_hist=args.calib_hist,
-        calib_clip=args.calib_clip,
-        note=args.note,
+        symbols=args.symbols,           # HubTrade 생성자 인자
+        exit_rules=exit_rules,
+        # 아래는 HubTrade가 사용한다면 전달; 아니면 무시됨
+        scorer=None, risk=None, router=None,
     )
 
     # 실행
@@ -326,5 +329,7 @@ def main():
 
     logger.info("=== DAYTRADE RUN END ===")
 
+
 if __name__ == '__main__':
     main()
+

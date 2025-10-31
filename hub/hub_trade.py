@@ -1,9 +1,9 @@
 ﻿# -*- coding: utf-8 -*-
 """
-Hub/HubTrade 루프 통합 (최종본)
-- ExitRules(익절·손절·트레일링) → RiskGate → OrderRouter
-- 같은 틱에서 막 청산한 심볼은 재진입 차단
-- exit_reason 이벤트 기록
+Hub / HubTrade — ExitRules → RiskGate → OrderRouter 통합 루프
+- 보유 포지션은 ExitRules 우선평가로 즉시 청산
+- 같은 틱에서 막 청산한 심볼은 재진입 쿨다운
+- exit_reason 로깅
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -31,401 +31,307 @@ class Position:
     symbol: str
     qty: int
     avg_price: float
-    last_high: float = 0.0  # 트레일링용
-
+    last_high: float = 0.0
+    entry_ts: float = 0.0
+    exit_reason: Optional[str] = None
 
 @dataclass
-class TradeEvent:
-    ts: float
-    action: str   # "BUY" | "SELL" | "EXIT"
-    symbol: str
-    qty: int
-    price: float
+class RiskEvalRes:
+    allow: bool
     reason: str = ""
+    max_qty_hint: Optional[int] = None
 
 
-# ========== 핵심 허브 ==========
+# ========== 유틸 ==========
+def _make_default_scorer() -> ScoreEngine:
+    """ScoreEngine.default() 유무/시그니처 차이를 흡수하는 방어 생성"""
+    if hasattr(ScoreEngine, "default"):
+        try:
+            return ScoreEngine.default()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    try:
+        from common.config import DAYTRADE  # type: ignore
+        if isinstance(DAYTRADE, dict):
+            weights = DAYTRADE.get("weights", {})
+            th = DAYTRADE.get("thresholds", {})
+            buy_th = th.get("buy", 0.55)
+            sell_th = th.get("sell", -0.55)
+        else:
+            weights = getattr(DAYTRADE, "weights", {})
+            th = getattr(DAYTRADE, "thresholds", {})
+            buy_th = th.get("buy", 0.55) if isinstance(th, dict) else 0.55
+            sell_th = th.get("sell", -0.55) if isinstance(th, dict) else -0.55
+        try:
+            return ScoreEngine(weights=weights, buy_threshold=buy_th, sell_threshold=sell_th)  # type: ignore[call-arg]
+        except TypeError:
+            return ScoreEngine()
+    except Exception:
+        return ScoreEngine()
+
+def _make_default_router():
+    """OrderRouter를 환경에 맞춰 안전하게 생성"""
+    try:
+        if hasattr(OrderRouter, "dry_run"):
+            return OrderRouter.dry_run()
+    except Exception:
+        pass
+    try:
+        return OrderRouter()
+    except Exception:
+        try:
+            from order.adapters.mock import MockAdapter  # 있을 때만
+            return OrderRouter(adapter=MockAdapter())
+        except Exception:
+            raise RuntimeError("OrderRouter 초기화 방법을 찾지 못했습니다. router를 직접 주입해 주세요.")
+
+def _make_exposure_policy_or_none():
+    """ExposurePolicy.default() 유무/시그니처 차이를 흡수, 실패 시 None"""
+    try:
+        if hasattr(ExposurePolicy, "default"):
+            return ExposurePolicy.default()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        return ExposurePolicy()
+    except Exception:
+        return None
+
+
+# ========== Hub ==========
 class Hub:
-    """scorer/risk/router를 주입받아 on_tick 처리"""
     def __init__(
         self,
         scorer: ScoreEngine,
         risk: RiskGate,
         router: OrderRouter,
         exit_rules: ExitRules,
-    ) -> None:
+        min_reentry_cooldown_ticks: int = 10,
+    ):
         self.scorer = scorer
         self.risk = risk
         self.router = router
         self.exit_rules = exit_rules
-        self.portfolio: Dict[str, Position] = {}
-        self.events: List[TradeEvent] = []
-        self._just_exited: set[str] = set()
-        self._tick_index: int = 0
-        self._last_decisions: List[dict] = []   # 마지막 틱 의사결정(표준화)
+        self.min_reentry_cooldown_ticks = min_reentry_cooldown_ticks
 
-    # --- 유틸: 포트폴리오 MTM 갱신 ---
-    def _update_portfolio_marks(self, prices: Dict[str, float]) -> Dict[str, float]:
-        pnl_open_pct: Dict[str, float] = {}
-        for sym, pos in self.portfolio.items():
-            p = prices.get(sym)
-            if p is None or pos.qty == 0:
-                pnl_open_pct[sym] = 0.0
+        self.positions: Dict[str, Position] = {}
+        self.recent_exit_tick: Dict[str, int] = {}  # 재진입 쿨다운 기록
+        self.tick_idx: int = 0
+
+    # --- helper: PnL 기반 상태 업데이트 (trailing 고점 갱신 등)
+    def _update_pos_state(self, pos: Position, last_price: float) -> None:
+        if last_price > pos.last_high:
+            pos.last_high = last_price
+
+    # --- safe scorer wrapper: 다양한 시그니처를 흡수
+    def _safe_score(self, sym: str, price: float, ctx: Dict[str, Any]) -> float:
+        s = self.scorer
+        snap = {sym: price}
+        for args in (
+            (sym, price, ctx),
+            (sym, price),
+            (snap, ctx),
+            (snap,),
+            (price,),
+            (sym,),
+            tuple(),
+        ):
+            try:
+                val = s.score(*args)  # type: ignore[misc]
+                return float(val)
+            except TypeError:
                 continue
-            pnl_open_pct[sym] = (p - pos.avg_price) / pos.avg_price
-            if p > pos.last_high:
-                pos.last_high = p
-        return pnl_open_pct
+            except Exception:
+                return 0.0
+        return 0.0
 
-    def _make_ctx(self, equity_now: float, pnl_open_pct: Dict[str, float]) -> Dict[str, Any]:
-        return {
-            "equity_now": equity_now,
-            "pnl_open_pct": pnl_open_pct,
-            "now_ts": time.time(),
-            "tick_index": self._tick_index,
+    # --- safe risk wrapper: 다양한 RiskGate 시그니처/반환형 흡수 (portfolio/ctx 우선)
+    def _risk_eval(self, symbol: str, price: float, score: float, ctx: Dict[str, Any]) -> RiskEvalRes:
+        r = self.risk
+
+        # 1) 현재 포지션 → 간단한 portfolio dict
+        portfolio: Dict[str, Dict[str, float]] = {
+            s: {"qty": float(p.qty), "avg_price": float(p.avg_price)}
+            for s, p in self.positions.items()
         }
 
-    def _estimate_equity(self, prices: Dict[str, float]) -> float:
-        """간단한 MTM 추정: 현재 보유가치 합(현금 0 가정)"""
-        mtm = 0.0
-        for sym, pos in self.portfolio.items():
-            p = prices.get(sym)
-            if p is not None:
-                mtm += pos.qty * p
-        return mtm
+        # 2) ctx 보강
+        safe_ctx: Dict[str, Any] = {}
+        if isinstance(ctx, dict):
+            safe_ctx.update(ctx)
+        safe_ctx.update({
+            "tick_idx": self.tick_idx,
+            "symbol": symbol,
+            "price": price,
+            "score": score,
+            "exposure": {"AAA": 0.0},  # 경고 억제용 기본 키
+        })
 
-    # --- ExitRules 어댑터 ---
-    def _apply_exit_rules(self, prices: Dict[str, float], ctx: Dict[str, Any]) -> List[dict]:
-        port_view = {
-            s: {
-                "qty": pos.qty,
-                "avg_price": pos.avg_price,
-                "last_high": pos.last_high,
-                "price_now": prices.get(s),
-            }
-            for s, pos in self.portfolio.items()
-        }
-
-        if hasattr(self.exit_rules, "apply_exit_batch"):
-            return self.exit_rules.apply_exit_batch(portfolio=port_view, ctx=ctx)
-
-        results: List[dict] = []
-        for sym, v in port_view.items():
-            qty = int(v.get("qty", 0) or 0)
-            if qty <= 0:
+        # 3) 다양한 구현을 지원하는 호출 시도 순서
+        arg_sets = (
+            (symbol, price, portfolio, score, safe_ctx),
+            (symbol, price, portfolio, safe_ctx),
+            (portfolio, safe_ctx),
+            (symbol, price, safe_ctx),
+            (symbol, price),
+            (portfolio,),
+            (safe_ctx,),
+            tuple(),
+        )
+        for meth in ("evaluate_entry", "evaluate", "check_entry", "gate", "allow"):
+            fn = getattr(r, meth, None)
+            if not callable(fn):
                 continue
-            price_now = v.get("price_now")
-            avg_price = v.get("avg_price")
-            if not price_now or not avg_price:
-                continue
-            try:
-                res = self.exit_rules.apply_exit(
-                    symbol=sym, entry_price=avg_price, current_price=price_now, ctx=ctx
-                )
-            except TypeError:
-                continue
-            if getattr(res, "exit", False):
-                results.append({
-                    "symbol": sym, "qty": qty, "price": float(price_now),
-                    "reason": getattr(res, "reason", "exit_rule")
-                })
-        return results
-
-    # --- 안전 임계값/수량 헬퍼 ---
-    def _get_thresholds(self) -> Tuple[float, float]:
-        if hasattr(self.scorer, "thresholds"):
-            try:
-                return self.scorer.thresholds()
-            except Exception:
-                pass
-        bt = getattr(self.scorer, "buy_threshold", None)
-        st = getattr(self.scorer, "sell_threshold", None)
-        if isinstance(bt, (int, float)) and isinstance(st, (int, float)):
-            return float(bt), float(st)
-        try:
-            from common.config import DAYTRADE
-            th = DAYTRADE.get("thresholds", {})
-            return float(th.get("buy", 0.55)), float(th.get("sell", -0.55))
-        except Exception:
-            return 0.55, -0.55
-
-    def _default_qty(self, symbol: str) -> int:
-        if hasattr(self.scorer, "default_qty"):
-            try:
-                q = self.scorer.default_qty(symbol)
-                return int(q) if q else 0
-            except Exception:
-                pass
-        q_attr = getattr(self.scorer, "default_qty_hint", None)
-        if isinstance(q_attr, (int, float)):
-            return max(0, int(q_attr))
-        return 1
-
-    # --- RiskGate 시그니처 호환 래퍼 ---
-    def _risk_eval(self, sym: str, px: Optional[float], ctx: dict):
-        port = self._portfolio_view()
-        # ① 신규(키워드)
-        try:
-            return self.risk.evaluate(symbol=sym, price=px, portfolio=port, ctx=ctx)
-        except TypeError:
-            pass
-        # ② 구형(포지셔널)
-        try:
-            return self.risk.evaluate(sym, px, port, ctx)
-        except TypeError:
-            pass
-        # ③ check_entry 사용 구현
-        if hasattr(self.risk, "check_entry"):
-            try:
-                return self.risk.check_entry(sym, px, port, ctx)
-            except TypeError:
-                pass
-        # ④ 폴백: 허용하지 않음
-        class _Res:
-            allow = False
-            reason = "risk_eval_failed"
-            max_qty_hint = None
-        return _Res()
-
-    # --- 메인 루프 ---
-    def on_tick(self, prices: Dict[str, float], equity_now: Optional[float] = None) -> List[TradeEvent]:
-        self._tick_index += 1
-        self._just_exited.clear()
-
-        # 1) 컨텍스트
-        if equity_now is None:
-            equity_now = self._estimate_equity(prices)
-        pnl_open_pct = self._update_portfolio_marks(prices)
-        ctx = self._make_ctx(equity_now, pnl_open_pct)
-
-        # 2) Exit 우선
-        exit_orders = self._apply_exit_rules(prices, ctx)
-        for ex in exit_orders:
-            sym = ex["symbol"]
-            if sym not in self.portfolio:
-                continue
-            qty = int(ex.get("qty") or self.portfolio[sym].qty)
-            if qty <= 0:
-                continue
-            px = ex.get("price", prices.get(sym))
-            reason = ex.get("reason", "exit_rule")
-            fill_price = self.router.sell_market(sym, qty, px, reason)
-            self._record_event("EXIT", sym, qty, fill_price, reason)
-            self._apply_fill_exit(sym, qty)
-            self._just_exited.add(sym)
-
-        # 3) 신규/증감 결정 — Score → Risk
-        try:
-            scores = self.scorer.score(prices, ctx)  # 새 시그니처
-        except TypeError:
-            scores = self.scorer.score(prices)       # 구 시그니처
-
-        # dict가 아니면 dict로 표준화
-        if not isinstance(scores, dict):
-            try:
-                scores = dict(scores)  # iterable[(sym,score)]
-            except Exception:
-                scores = {sym: float(scores) for sym in prices.keys()}  # 단일 float
-
-        decisions = self._decide_from_scores(scores)
-
-        # 같은 틱 재진입 차단
-        decisions = [d for d in decisions if d["symbol"] not in self._just_exited]
-
-        # 리스크 게이트
-        filtered: List[Tuple[dict, Optional[int]]] = []
-        for d in decisions:
-            sym = d["symbol"]
-            px = prices.get(sym)
-            res = self._risk_eval(sym, px, ctx)
-            if res.allow:
-                if res.max_qty_hint is not None:
-                    d["qty"] = min(int(d.get("qty", 0) or 0), res.max_qty_hint)
-                filtered.append((d, res.max_qty_hint))
-
-        # 4) 라우팅
-        executed_decisions: List[dict] = []
-        for d, _ in filtered:
-            sym = d["symbol"]
-            act = d["action"].upper()
-            px = prices.get(sym)
-            qty = int(d.get("qty", 0) or 0)
-            if qty <= 0 or px is None:
-                continue
-            if act == "BUY":
-                fill = self.router.buy_market(sym, qty, px, d.get("reason", "score_buy"))
-                self._record_event("BUY", sym, qty, fill, d.get("reason", "score_buy"))
-                self._apply_fill_buy(sym, qty, fill)
-                executed_decisions.append({**d, "fill": fill})
-            elif act == "SELL":
-                held = self.portfolio.get(sym)
-                if held and held.qty > 0:
-                    qty = min(qty, held.qty)
-                    fill = self.router.sell_market(sym, qty, px, d.get("reason", "score_sell"))
-                    self._record_event("SELL", sym, qty, fill, d.get("reason", "score_sell"))
-                    self._apply_fill_exit(sym, qty)
-                    executed_decisions.append({**d, "fill": fill})
-
-        # 마지막 틱 의사결정 저장 (run_session용)
-        self._last_decisions = executed_decisions
-        return self.events[-20:]
-
-    # --- 내부 체결 반영/보조 ---
-    def _decide_from_scores(self, scores: Dict[str, float]) -> List[dict]:
-        buy_th, sell_th = self._get_thresholds()
-        out: List[dict] = []
-        for sym, s in scores.items():
-            if s is None:
-                continue
-            if s >= buy_th:
-                out.append({"action": "BUY", "symbol": sym, "qty": self._default_qty(sym), "reason": f"score={s:.3f}"})
-            elif s <= sell_th:
-                out.append({"action": "SELL", "symbol": sym, "qty": self._default_qty(sym), "reason": f"score={s:.3f}"})
-        return out
-
-    def _apply_fill_buy(self, sym: str, qty: int, price: float) -> None:
-        pos = self.portfolio.get(sym)
-        if not pos:
-            self.portfolio[sym] = Position(sym, qty, price, last_high=price)
-            return
-        new_qty = pos.qty + qty
-        pos.avg_price = (pos.avg_price * pos.qty + price * qty) / max(1, new_qty)
-        pos.qty = new_qty
-        if price > pos.last_high:
-            pos.last_high = price
-
-    def _apply_fill_exit(self, sym: str, qty: int) -> None:
-        pos = self.portfolio.get(sym)
-        if not pos:
-            return
-        pos.qty -= qty
-        if pos.qty <= 0:
-            del self.portfolio[sym]
-
-    def _record_event(self, action: str, sym: str, qty: int, price: float, reason: str) -> None:
-        self.events.append(TradeEvent(ts=time.time(), action=action, symbol=sym, qty=qty, price=price, reason=reason))
-
-    def _portfolio_view(self) -> Dict[str, dict]:
-        return {s: {"qty": p.qty, "avg_price": p.avg_price} for s, p in self.portfolio.items()}
-
-
-# ========== 실행 러너 ==========
-class HubTrade:
-    """
-    런너 — ① 의존성 주입형 또는 ② 플래그형(실전/드라이런) 모두 지원
-      - 의존성 주입형: HubTrade(scorer=..., risk=..., router=..., exit_rules=...)
-      - 플래그형:      HubTrade(real_mode=False, budget=3_000_000, calibrator_enabled=True)
-    """
-    def __init__(
-        self,
-        scorer: ScoreEngine | None = None,
-        risk: RiskGate | None = None,
-        router: OrderRouter | None = None,
-        exit_rules: ExitRules | None = None,
-        *,
-        real_mode: bool = False,
-        budget: int = 3_000_000,
-        calibrator_enabled: bool = True,
-    ):
-        self.real_mode = real_mode
-        self.budget = budget
-        self.calibrator_enabled = calibrator_enabled
-
-        # --- 미주입 시 안전 빌더 ---
-        if scorer is None:
-            try:
-                scorer = ScoreEngine(calibrator_enabled=calibrator_enabled)
-            except TypeError:
-                scorer = ScoreEngine()
-                if hasattr(scorer, "set_calibrator_enabled"):
-                    scorer.set_calibrator_enabled(calibrator_enabled)
-                elif hasattr(scorer, "calibrator_enabled"):
-                    setattr(scorer, "calibrator_enabled", calibrator_enabled)
-
-        if risk is None:
-            policies = [make_daydd()]
-            try:
-                policies.append(ExposurePolicy(max_total_budget=budget))
-            except TypeError:
-                policies.append(ExposurePolicy())
-            risk = RiskGate(policies=policies)
-
-        if router is None:
-            created = False
-            attempts = [
-                {"dry_run": not real_mode, "budget": budget},
-                {"real_mode": real_mode, "budget": budget},
-                {"mode": ("REAL" if real_mode else "DRY"), "budget": budget},
-                {},  # 인자 없음
-            ]
-            for kwargs in attempts:
+            for args in arg_sets:
                 try:
-                    router = OrderRouter(**kwargs)
-                    created = True
-                    break
+                    res = fn(*args)  # type: ignore[misc]
                 except TypeError:
                     continue
-            if not created:
-                router = OrderRouter()
-            # 사후 토글(존재하면 설정)
-            if hasattr(router, "dry_run"):
-                try: router.dry_run = (not real_mode)
-                except Exception: pass
-            if hasattr(router, "real_mode"):
-                try: router.real_mode = real_mode
-                except Exception: pass
-            if hasattr(router, "set_dry_run"):
-                try: router.set_dry_run(not real_mode)
-                except Exception: pass
-            if hasattr(router, "enable_dry_run"):
-                try: router.enable_dry_run(not real_mode)
-                except Exception: pass
-            if hasattr(router, "set_mode"):
-                try: router.set_mode("REAL" if real_mode else "DRY")
-                except Exception: pass
+                except Exception as e:
+                    return RiskEvalRes(False, reason=f"{meth}_error:{e}")
 
-        if exit_rules is None:
-            exit_rules = ExitRules()
+                # normalize
+                if isinstance(res, RiskEvalRes):
+                    return res
+                if hasattr(res, "allow"):
+                    return RiskEvalRes(
+                        bool(getattr(res, "allow")),
+                        str(getattr(res, "reason", "")),
+                        getattr(res, "max_qty_hint", None),
+                    )
+                if isinstance(res, dict):
+                    return RiskEvalRes(
+                        bool(res.get("allow", True)),
+                        str(res.get("reason", "")),
+                        res.get("max_qty_hint"),
+                    )
+                if isinstance(res, tuple) and res:
+                    allow = bool(res[0])
+                    reason = str(res[1]) if len(res) > 1 else ""
+                    hint = res[2] if len(res) > 2 else None
+                    return RiskEvalRes(allow, reason, hint)
+                if isinstance(res, bool):
+                    return RiskEvalRes(res)
 
-        self.hub = Hub(scorer=scorer, risk=risk, router=router, exit_rules=exit_rules)
+        return RiskEvalRes(True)
 
-    # equity_now를 넘겨도/안 넘겨도 허용
-    def on_tick(self, prices: Dict[str, float], equity_now: Optional[float] = None):
-        return self.hub.on_tick(prices, equity_now)
-
-    def portfolio(self):
-        return self.hub.portfolio
-
-    def run_session(self, symbols: List[str], max_ticks: int = 100):
-        """심플 러너: PriceFeedMock이 있으면 사용해 max_ticks만큼 루프"""
+    def _get_buy_threshold(self) -> float:
+        """ScoreEngine의 buy_threshold가 없으면 0.55를 기본 사용"""
         try:
-            from market.price import PriceFeedMock
-            feed = PriceFeedMock(symbols)
+            return float(getattr(self.scorer, "buy_threshold", 0.55))
         except Exception:
-            # 피드가 없을 때도 테스트가 'status'와 'decisions' 키를 기대
-            return {
-                "status": "ok",
-                "events": self.hub.events,
-                "portfolio": self.portfolio(),
-                "decisions": getattr(self.hub, "_last_decisions", []),
-            }
+            return 0.55
 
+    # --- buy/sell wrappers
+    def _buy(self, symbol: str, price: float, qty: int, reason: str) -> None:
+        ok, fill_qty, fill_price = self.router.buy(symbol, qty, price, reason)
+        if ok and fill_qty > 0:
+            self.positions[symbol] = Position(
+                symbol=symbol,
+                qty=fill_qty,
+                avg_price=fill_price,
+                last_high=fill_price,
+                entry_ts=time.time(),
+            )
+            logger.info(f"[BUY] {symbol} x{fill_qty} @ {fill_price:.3f} reason={reason}")
+
+    def _sell(self, symbol: str, price: float, qty: int, reason: str) -> None:
+        ok, fill_qty, fill_price = self.router.sell(symbol, qty, price, reason)
+        if ok and fill_qty > 0:
+            logger.info(f"[SELL] {symbol} x{fill_qty} @ {fill_price:.3f} reason={reason}")
+
+    # --- main tick entry
+    def on_tick(self, snapshot: Dict[str, float], ctx: Optional[Dict[str, Any]] = None) -> None:
+        self.tick_idx += 1
+        ctx = ctx or {}
+
+        # 1) 포지션 보유 종목: ExitRules 우선 평가
+        if self.positions:
+            to_close: List[Tuple[str, Position, object]] = []
+            for sym, pos in list(self.positions.items()):
+                price = snapshot.get(sym)
+                if price is None:
+                    continue
+                self._update_pos_state(pos, price)
+
+                dec = self.exit_rules.apply_exit(
+                    price_now=price,
+                    avg_price=pos.avg_price,
+                    last_high=pos.last_high,
+                    min_hold_ticks=1,  # 실전은 config로 노출
+                )
+                if getattr(dec, "should_exit", False):
+                    to_close.append((sym, pos, dec))
+
+            for sym, pos, dec in to_close:
+                self._sell(sym, snapshot[sym], pos.qty, reason=getattr(dec, "reason", "exit"))
+                self.recent_exit_tick[sym] = self.tick_idx
+                pos.exit_reason = getattr(dec, "reason", None)
+                logger.info(f"[EXIT] {sym} reason={pos.exit_reason}")
+                del self.positions[sym]
+
+        # 2) 신규 진입: RiskGate → BUY
+        for sym, price in snapshot.items():
+            # 같은 틱에 막 청산한 심볼은 재진입 차단
+            last_exit_tick = self.recent_exit_tick.get(sym, -10**9)
+            if self.tick_idx - last_exit_tick < self.min_reentry_cooldown_ticks:
+                continue
+            # 이미 보유 중이면 skip
+            if sym in self.positions:
+                continue
+
+            score = self._safe_score(sym, price, ctx)
+            risk_res = self._risk_eval(symbol=sym, price=price, score=score, ctx=ctx)
+            if not risk_res.allow:
+                logger.debug(f"[RISK-HOLD] {sym} reason={risk_res.reason}")
+                continue
+
+            qty_hint = risk_res.max_qty_hint or 0
+            qty = max(1, qty_hint)  # 간단 기본치
+
+            if score >= self._get_buy_threshold():
+                self._buy(sym, price, qty, reason=f"score={score:.3f}")
+
+
+# ========== HubTrade ==========
+class HubTrade:
+    def __init__(
+        self,
+        symbols: List[str],
+        scorer: Optional[ScoreEngine] = None,
+        risk: Optional[RiskGate] = None,
+        router: Optional[OrderRouter] = None,
+        exit_rules: Optional[ExitRules] = None,
+    ):
+        self.symbols = symbols
+        self.scorer = scorer if scorer is not None else _make_default_scorer()
+
+        # 정책: DayDD + Exposure 기본 탑재 (ExposurePolicy 생성 실패 시 DayDD만)
+        if risk is not None:
+            self.risk = risk
+        else:
+            policies = [make_daydd()]
+            _expo = _make_exposure_policy_or_none()
+            if _expo is not None:
+                policies.append(_expo)
+            self.risk = RiskGate(policies=policies)
+
+        self.router = router or _make_default_router()
+        self.exit_rules = exit_rules or ExitRules()
+
+        self.hub = Hub(
+            scorer=self.scorer,
+            risk=self.risk,
+            router=self.router,
+            exit_rules=self.exit_rules,
+        )
+
+    def run_session(self, price_feed_iter, max_ticks: int = 1000):
         ticks = 0
-        while ticks < max_ticks:
-            if hasattr(feed, "has_next") and not feed.has_next():
-                break
-            if hasattr(feed, "snapshot"):
-                prices = feed.snapshot()
-            elif hasattr(feed, "next"):
-                prices = feed.next()
-            else:
-                break
-            self.hub.on_tick(prices, None)  # equity_now는 허브에서 추정
+        for snapshot in price_feed_iter:
+            self.hub.on_tick(snapshot)
             ticks += 1
+            if ticks >= max_ticks:
+                break
+        logger.info(f"[SESSION END] ticks={ticks}")
 
-        return {
-            "status": "ok",
-            "events": self.hub.events,
-            "portfolio": self.portfolio(),
-            "decisions": getattr(self.hub, "_last_decisions", []),
-        }

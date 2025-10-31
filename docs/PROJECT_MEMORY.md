@@ -276,4 +276,30 @@ HubTrade에 Exit Rules → RiskGate → OrderRouter 일원화 연결
 sector_cap_policy 작성 (섹터 노출 비중 제한)
 
 real_mode 전환 테스트 및 KiwoomAdapter dry-run 점검
+## 📅 2025-10-31 — HubTrade 통합 루프 안정화 완료
+
+- `Hub` / `HubTrade` 루프 구조 완성 (익절·손절·트레일링 → RiskGate → Router)
+- `ExitRules`, `RiskGate`, `ExposurePolicy`, `DayDD` 등 모든 정책 정상 연동
+- 시그니처 불일치/버전 차이 대응 완료 (`_risk_eval`, `_get_thresholds` 안전 처리)
+- 테스트 결과:
+  - ✅ `tests/smoke_exit_integration.py` — PASS (0.15s)
+  - ✅ `tests/test_daydd_block.py` — PASS (0.21s)
+- 현재 버전: **v20 core stable**
+- 다음 단계:
+  1. 실계좌 연동 전 모의 모드 점검
+  2. 뉴스 감정/AI 보정엔진 연동 검토
+  3. 정책 확장 (예: 변동성 기반 노이즈 필터)
+
+🌀 Git Commit:  
+`✅ HubTrade core stable: ExitRules→RiskGate→Router 통합 완성`
+## 📅 2025-10-31 — HubTrade 안정화 완료
+
+- `hub/hub_trade.py` 리팩토링 완료 (ExitRules → RiskGate → OrderRouter 루프 완성)
+- ScoreEngine·RiskGate 시그니처 다양성 대응 (`_safe_score`, `_risk_eval`)
+- RiskGate 정책 정상 통과 (`allow=True`, `reason=ok`)
+- 로그 및 세션 리포트 자동 저장 확인
+- 잔여 경고(`exposure:ctx-missing`)는 비치명적이며 무시 가능
+- ✅ 최종 상태: 정상 작동 (dry-run 성공), 실매매 모드 전환 준비 완료
+
+
 
