@@ -124,8 +124,9 @@ class Hub:
 
         # ---- Risk ctx 기본 슬롯
         self.config: Dict[str, Any] = config or {}
-        self.sector_map: Dict[str, str] = {}  # 다음 단계(섹터 정책)에서 실제 값 주입
-        # equity/sector 노출 계산 스텁 (필요 시 덮어쓰기)
+        self.sector_map: Dict[str, str] = {}  # 섹터 정책에서 사용할 맵
+        self.sector_of = lambda s: self.sector_map.get(s)  # ✅ 섹터 판별 함수
+        # equity/sector 노출 계산 스텁
         self._equity_now = lambda: float(self.config.get("budget") or 0.0)  # 예산을 기본 equity로
         self._sector_exposure = lambda: {}
 
@@ -174,14 +175,13 @@ class Hub:
         budget_val = float(self.config.get("budget") or 0.0)
         equity_val = float(self._equity_now() or budget_val)
 
-        # ExposurePolicy 호환용 블록/별칭
         account_block = {"equity": equity_val}
         exposure_block = {
             "budget": budget_val,
             "equity": equity_val,
             "equity_now": equity_val,
             "cash": budget_val,               # alias
-            "account": account_block,
+            "account": account_block,         # ExposurePolicy 호환
             "portfolio": portfolio,
             "positions": portfolio,           # alias
             "sector_map": self.sector_map,
@@ -204,8 +204,9 @@ class Hub:
             "positions": portfolio,
             "sector_map": self.sector_map,
             "sector_exposure": exposure_block["sector_exposure"],
+            "sector_of": self.sector_of,      # ✅ 섹터 판별 함수 전달
 
-            # nested blocks (여러 구현 호환)
+            # nested blocks
             "exposure": exposure_block,
             "exposure_ctx": exposure_block,
             "risk_ctx": exposure_block,
@@ -237,7 +238,6 @@ class Hub:
             pass
 
         # 3) 다양한 구현을 지원하는 호출 시도: kwargs 우선 → 위치인자 폴백
-        # 3-1) kwargs 우선
         for meth in ("evaluate_entry", "evaluate", "check_entry", "gate", "allow"):
             fn = getattr(r, meth, None)
             if not callable(fn):
@@ -267,7 +267,6 @@ class Hub:
             except Exception as e:
                 return RiskEvalRes(False, reason=f"{meth}_error:{e}")
 
-        # 3-2) 위치 인자 폴백
         arg_sets = (
             (symbol, price, portfolio, score, safe_ctx),
             (symbol, price, portfolio, safe_ctx),
@@ -364,7 +363,7 @@ class Hub:
             "positions": {
                 s: {"qty": float(p.qty), "avg_price": float(p.avg_price)}
                 for s, p in self.positions.items()
-            },
+            },  # alias
             "sector_map": self.sector_map,
             "sector_exposure": self._sector_exposure() or {},
             "account": account_block,
@@ -383,6 +382,7 @@ class Hub:
             "exposure": exposure_block,
             "exposure_ctx": exposure_block,
             "risk_ctx": exposure_block,
+            "sector_of": self.sector_of,  # ✅ 섹터 함수 주입
         })
 
         # 1) 포지션 보유 종목: ExitRules 우선 평가
@@ -420,17 +420,21 @@ class Hub:
             if sym in self.positions:
                 continue
 
-            score = self._safe_score(sym, price, safe_ctx)
-            risk_res = self._risk_eval(symbol=sym, price=price, score=score, ctx=safe_ctx)
+            # 임시 계획 수량(계좌 5% 기준) → 정책이 planned_qty를 고려해 하드블록 판단
+            planned_qty = max(1, int((budget_val * 0.05) / max(1e-9, float(price))))
+            safe_ctx["planned_qty"] = planned_qty  # ✅ planned_qty 주입
+
+            score = self._safe_score(sym, float(price), safe_ctx)
+            risk_res = self._risk_eval(symbol=sym, price=float(price), score=score, ctx=safe_ctx)
             if not risk_res.allow:
                 logger.debug(f"[RISK-HOLD] {sym} reason={risk_res.reason}")
                 continue
 
-            qty_hint = risk_res.max_qty_hint or 0
+            qty_hint = int(risk_res.max_qty_hint or 0)
             qty = max(1, qty_hint)
 
             if score >= self._get_buy_threshold():
-                self._buy(sym, price, qty, reason=f"score={score:.3f}")
+                self._buy(sym, float(price), qty, reason=f"score={score:.3f}")
 
 
 # ========== HubTrade ==========

@@ -13,7 +13,7 @@ DAYTRADE = {
         "news":     0.10,  # 뉴스 감정 가중치 (초기값)
     },
     "thresholds": {
-        "buy":   0.55,
+        "buy":   0.2,
         "sell": -0.55,
     },
     "exits": {

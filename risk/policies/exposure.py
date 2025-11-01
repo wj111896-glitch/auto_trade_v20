@@ -16,8 +16,8 @@ __all__ = ["ExposureConfig", "ExposurePolicy"]
 class ExposureConfig:
     """익스포저(노출) 한도 파라미터"""
     # 자본 대비 한도
-    max_total_exposure_pct: float = 0.60      # 전체 포트폴리오 노출 한도
-    max_symbol_exposure_pct: float = 0.20     # 종목당 노출 한도
+    max_total_exposure_pct: float = 0.1      # 전체 포트폴리오 노출 한도
+    max_symbol_exposure_pct: float = 0.3     # 종목당 노출 한도
     max_sector_exposure_pct: Optional[float] = None  # 섹터 한도 (없으면 미적용)
 
     # 사이징 관련
@@ -40,15 +40,12 @@ class ExposurePolicy(BasePolicy):
 
     def __init__(self, cfg: Optional[ExposureConfig] = None):
         self.cfg = cfg or ExposureConfig()
-        # Hub 쪽에서 set_ctx / 속성 주입해 주는 경우를 대비해 self.ctx를 쓸 수 있게 둠.
+        # RiskGate / Hub가 set_ctx 또는 속성 주입해 주는 경우 대응
         self.ctx: Dict[str, Any] = {}
 
     # ---- helpers ---------------------------------------------------------
     def _merge_ctx(self, ctx: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        인자로 들어온 ctx가 비거나 누락되면 self.ctx를 폴백으로 사용.
-        RiskGate가 ctx를 전달하지 않는 구현까지 호환하기 위한 안전장치.
-        """
+        """인자로 들어온 ctx가 비거나 누락되면 self.ctx를 폴백으로 사용."""
         base = dict(self.ctx or {})
         if isinstance(ctx, dict):
             base.update(ctx)
@@ -179,8 +176,7 @@ class ExposurePolicy(BasePolicy):
             sector_cap_ok = remain["sector"] - planned_val > 0
 
         if not total_cap_ok:
-            # 사용비율 대략 표시(안정성을 위해 작은 분모 보정)
-            return PolicyResult(False, f"exposure:block:total")
+            return PolicyResult(False, "exposure:block:total")
         if not symbol_cap_ok:
             return PolicyResult(False, "exposure:block:symbol")
         if not sector_cap_ok:
