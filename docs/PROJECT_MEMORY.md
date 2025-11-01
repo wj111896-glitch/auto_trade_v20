@@ -301,5 +301,37 @@ real_mode 전환 테스트 및 KiwoomAdapter dry-run 점검
 - 잔여 경고(`exposure:ctx-missing`)는 비치명적이며 무시 가능
 - ✅ 최종 상태: 정상 작동 (dry-run 성공), 실매매 모드 전환 준비 완료
 
+🧭 PROJECT MEMORY — auto_trade_v20
+📅 2025-11-01 현재 기준
+⚙️ 전략 운용 프로필: 중립형 (Exposure 70%)
+항목	설정값	설명
+총 예산 (budget)	3,000,000원	현재 세션 운용자본
+총 노출 한도 (max_total_exposure_pct)	0.70 (70%)	시장 전체 노출 상한
+종목당 한도 (max_symbol_exposure_pct)	0.20 (20%)	개별 종목당 최대 비중
+섹터 한도 (max_sector_exposure_pct)	0.35 (35%)	동일 산업군 내 한도
+현금 버퍼	30% (900,000원)	리스크 완충 + 재진입 여유
+DD 중단 한도 (day_dd_kill)	0.03 (3%)	일중 손실 3% 이상 시 매매 중단
+리스크 모드	중립형 (Balanced)	수익-안정성 균형형 프로필
+🧩 참고 설정 경로
 
+risk/policies/exposure.py → ExposureConfig
+
+common/config.py → DAYTRADE["risk"]
+
+run_daytrade.py 실행 시 --budget 인자 적용됨
+
+🧠 주석
+
+총 노출 70%는 리스크 완충과 기회 포착의 밸런스형 설정
+
+섹터 및 종목 분산 한도는 보수적으로 유지
+
+향후 시장 변동성이 완화되면 공격형(90%) 또는 **보수형(50%)**으로 조정 가능
+
+✅ 기록 완료 후 요약 로그:
+[MEMO] 2025-11-01 — 중립형 운용(총노출 70%) 설정 PROJECT_MEMORY.md에 반영됨.
+📅 2025-11-01 — SectorCapPolicy 통합 완료, RiskGate 3중 정책 활성화
+✅ smoke_sector_cap_integration.py : 3 passed
+📅 2025-11-01 — SectorCapPolicy HubTrade 통합 테스트 3 passed” 로그
+2025-11-01 — SectorCap 35% → 40% 조정 완료 (중립형 설정 확정)
 

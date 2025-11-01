@@ -44,10 +44,8 @@ def get_project_logger(name: str, log_file: str) -> logging.Logger:
         from obs.log import get_logger as project_get_logger  # type: ignore
         logger = project_get_logger(name)
         # 파일핸들 없으면 추가
-        for h in logger.handlers:
-            if isinstance(h, logging.FileHandler):
-                break
-        else:
+        has_file = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+        if not has_file:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
             fh = logging.FileHandler(log_file, encoding='utf-8')
             fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s - %(message)s'))
@@ -77,6 +75,50 @@ def load_project_config(logger: logging.Logger) -> RunnerConfig:
     except Exception:
         logger.warning("common.config.DAYTRADE 를 찾을 수 없어 기본값으로 진행합니다.")
     return cfg
+
+
+# === ③-1 섹터 컨텍스트 유틸 ===
+def load_sector_map(path: str, logger: logging.Logger) -> Dict[str, str]:
+    """
+    CSV: symbol,sector
+    """
+    mapping: Dict[str, str] = {}
+    try:
+        p = Path(path)
+        if not p.exists():
+            logger.warning(f"섹터맵 파일 없음: {path} (빈 맵으로 진행)")
+            return mapping
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.lower().startswith("symbol"):
+                    continue
+                parts = [x.strip() for x in line.split(",")]
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    mapping[parts[0]] = parts[1]
+        logger.info(f"[Sector] loaded map: {len(mapping)} symbols from {path}")
+    except Exception as e:
+        logger.warning(f"[Sector] load_sector_map 실패: {e}")
+    return mapping
+
+def build_sector_ctx(portfolio: Dict[str, dict], sector_map: Dict[str, str], budget: Optional[float]) -> Dict[str, object]:
+    """
+    portfolio 예시: {"AAA":{"qty":10,"avg_price":..., "value":..., "sector": "IT"}, ...}
+    sector_exposure: 섹터별 평가금액 합계
+    """
+    budget_val = float(budget) if budget is not None else 0.0
+    sector_exp: Dict[str, float] = {}
+    for sym, pos in (portfolio or {}).items():
+        sec = pos.get("sector") or sector_map.get(sym)
+        if not sec:
+            continue
+        val = float(pos.get("value") or (pos.get("qty", 0) * pos.get("avg_price", 0.0)))
+        sector_exp[sec] = sector_exp.get(sec, 0.0) + val
+    return {
+        "budget": budget_val,
+        "symbol_sector": sector_map or {},
+        "sector_exposure": sector_exp
+    }
 
 
 # === ④ 리포트 작성 유틸(전역) ===
@@ -206,13 +248,27 @@ class HubAdapter:
         self.hub = self.hub_cls(**kwargs)
         return self
 
-    def run(self, symbols: List[str], max_ticks: int) -> dict:
+    def run(self, symbols: List[str], max_ticks: int, ctx: Optional[Dict[str, object]] = None) -> dict:
         if self.hub is None:
             raise RuntimeError("Hub not initialized")
-        # HubTrade.run_session(price_feed_iter, max_ticks) 시그니처에 맞춰 호출
         feed = make_price_feed(symbols, max_ticks)
-        result = self.hub.run_session(price_feed_iter=feed, max_ticks=max_ticks)
-        return {"result": str(result), "decisions": []}  # 필요 시 Hub에서 결정 로그 수집하도록 확장
+
+        # 가능한 경우 컨텍스트를 run_session에 전달 (미지원이면 조용히 건너뜀)
+        try:
+            result = self.hub.run_session(price_feed_iter=feed, max_ticks=max_ticks, ctx=ctx)  # type: ignore
+        except TypeError:
+            try:
+                result = self.hub.run_session(price_feed_iter=feed, max_ticks=max_ticks)  # type: ignore
+                # Hub가 set_context 인터페이스를 제공하면 설정
+                if hasattr(self.hub, "set_context"):
+                    try:
+                        self.hub.set_context(ctx or {})
+                    except Exception:
+                        pass
+            except Exception:
+                # 최후 폴백
+                result = self.hub.run_session(feed, max_ticks)  # type: ignore
+        return {"result": str(result), "decisions": []}
 
 
 # === ⑦ CLI ===
@@ -264,7 +320,7 @@ def main():
         cfg.real_mode = False
     elif getattr(args, "real", False):
         cfg.real_mode = True
-    if args.budget is not None:     
+    if args.budget is not None:
         cfg.budget = args.budget
 
     # ✅ HubTrade로 넘길 실제 실행 설정(예산/모드/메모)
@@ -288,10 +344,32 @@ def main():
         config=hub_config,
     )
 
+    # ==== 섹터 컨텍스트 준비 ====
+    # 1) 섹터맵 로드
+    sector_map_path = os.path.join(BASE_DIR, "data", "sector_map.csv")
+    sector_map = load_sector_map(sector_map_path, logger)
+
+    # 2) 현재 포트폴리오 얻기 (허브가 노출하면 사용, 없으면 빈 포트폴리오)
+    current_portfolio: Dict[str, dict] = {}
+    try:
+        if hasattr(hub, "hub") and getattr(hub, "hub", None) is not None:
+            # HubTrade 구현에 따라 속성명이 다를 수 있으므로 폭넓게 시도
+            for attr in ("portfolio", "_portfolio", "positions"):
+                if hasattr(hub.hub, attr):
+                    val = getattr(hub.hub, attr)
+                    if isinstance(val, dict):
+                        current_portfolio = val
+                        break
+    except Exception:
+        pass
+
+    # 3) 섹터 컨텍스트 생성
+    sector_ctx = build_sector_ctx(current_portfolio, sector_map, cfg.budget)
+
     # 실행
     session_result: dict = {}
     try:
-        session_result = hub.run(symbols=args.symbols, max_ticks=args.max_ticks)
+        session_result = hub.run(symbols=args.symbols, max_ticks=args.max_ticks, ctx=sector_ctx)
     except KeyboardInterrupt:
         logger.warning("사용자 중단(KeyboardInterrupt)")
     except Exception as e:
@@ -310,6 +388,11 @@ def main():
             "lr": args.calib_lr,
             "hist": args.calib_hist,
             "clip": args.calib_clip,
+        },
+        "sector_ctx": {
+            "budget": sector_ctx.get("budget"),
+            "symbol_sector_count": len(sector_ctx.get("symbol_sector", {})),
+            "sector_exposure_keys": list((sector_ctx.get("sector_exposure") or {}).keys()),
         },
         "result": session_result,
         "ended_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -340,4 +423,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 

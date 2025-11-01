@@ -37,7 +37,7 @@ except Exception:
         reason: str = ""
         max_qty_hint: Optional[int] = None
 
-# 노출(익스포저)
+# Exposure (총액/심볼 한도)
 from .policies.exposure import ExposurePolicy, ExposureConfig  # type: ignore
 
 # DayDD (있으면 사용)
@@ -48,11 +48,18 @@ try:
 except Exception:
     DayDDPolicy = None
 
-# (선택) 별도 래퍼가 있는 프로젝트도 지원
+# 프로젝트 래퍼 (make_daydd) 지원
 try:
     from .day_dd import make_daydd  # type: ignore
 except Exception:
     make_daydd = None  # type: ignore
+
+# ✅ SectorCapPolicy 추가
+try:
+    from .policies.sector_cap import SectorCapPolicy, SectorParams  # type: ignore
+except Exception:
+    SectorCapPolicy = None
+    SectorParams = None
 
 
 # ---------- 유틸 ----------
@@ -71,14 +78,12 @@ def _norm(res: Any) -> Dict[str, Any]:
         out["reason"] = str(r) if r is not None else None
         return out
 
-    # PolicyResult 호환
     if hasattr(res, "allow") or hasattr(res, "ok"):
         ok = getattr(res, "allow", getattr(res, "ok", True))
         out["allow"] = bool(ok)
         out["reason"] = getattr(res, "reason", None)
         return out
 
-    # truthy fallback
     out["allow"] = bool(res)
     return out
 
@@ -86,18 +91,9 @@ def _norm(res: Any) -> Dict[str, Any]:
 # ======================== RiskGate ========================
 class RiskGate:
     """
-    Primary:
-      - evaluate(context) -> {allow, scale, force_flatten, reason}
-
-    Adapter:
-      - allow_entry(symbol, portfolio, price, ctx=None) -> bool
-      - size_for(symbol, price, portfolio, ctx=None) -> int
-
-    Hub 호환:
-      - check(symbol, price, portfolio, ctx=None) -> (allow, reason, size_hint)
-
-    Legacy:
-      - apply(score, snapshot) -> decision(dict)
+    정책 병합 게이트웨이
+    - evaluate(context) -> {allow, scale, force_flatten, reason}
+    - allow_entry(), size_for(), check() 제공
     """
 
     def __init__(self, policies: Optional[List[Policy]] = None, budget: Optional[float] = None) -> None:
@@ -105,34 +101,44 @@ class RiskGate:
         if policies is None:
             pols: List[Policy] = []
 
-            # DayDD 우선 (있을 때만)
+            # (1) DayDD
             if make_daydd is not None:
                 try:
-                    pols.append(make_daydd())  # 프로젝트별 래퍼 우선
+                    pols.append(make_daydd())
                 except Exception as e:
                     log.warning(f"[RiskGate] make_daydd() 실패: {e}")
             elif DayDDPolicy is not None:
                 try:
-                    pols.append(DayDDPolicy())  # 기본 정책
+                    pols.append(DayDDPolicy())
                 except Exception as e:
                     log.warning(f"[RiskGate] DayDDPolicy 생성 실패: {e}")
 
-            # Exposure 기본 주입
+            # (2) Exposure
             try:
                 pols.append(ExposurePolicy(ExposureConfig()))
             except Exception as e:
                 log.warning(f"[RiskGate] ExposurePolicy 생성 실패: {e}")
 
+            # ✅ (3) SectorCap — 섹터 집중도 제한
+            if SectorCapPolicy is not None and SectorParams is not None:
+                try:
+                    pols.append(SectorCapPolicy(SectorParams(sector_cap_pct=0.35)))
+                    log.info("[RiskGate] SectorCapPolicy 활성화 (max 35%)")
+                except Exception as e:
+                    log.warning(f"[RiskGate] SectorCapPolicy 생성 실패: {e}")
+            else:
+                log.warning("[RiskGate] SectorCapPolicy 미탑재")
+
             self.policies = pols
         else:
             self.policies = policies
 
-    # ---------- 공통 컨텍스트 병합 ----------
+    # ---------- 컨텍스트 병합 ----------
     @staticmethod
     def _merge_ctx(ctx: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return dict(ctx or {})
 
-    # ---------- 확장형: evaluate 병합 ----------
+    # ---------- evaluate ----------
     def evaluate(self, context: Dict[str, Any]) -> Dict[str, Any]:
         agg_allow = True
         agg_scale = 1.0
@@ -143,7 +149,7 @@ class RiskGate:
             try:
                 if hasattr(p, "evaluate"):
                     res = _norm(p.evaluate(context))  # type: ignore
-                elif hasattr(p, "check_entry"):  # 구 스타일
+                elif hasattr(p, "check_entry"):
                     sym = context.get("symbol") or context.get("sym") or "NA"
                     price = float(context.get("price", 0.0) or 0.0)
                     pf = context.get("portfolio") or {}
@@ -173,7 +179,7 @@ class RiskGate:
         )
         return out
 
-    # ---------- 체결 손익 전달 훅 ----------
+    # ---------- 체결 손익 전달 ----------
     def on_fill_realized(self, realized_pnl_delta: float) -> None:
         for p in self.policies:
             try:
@@ -182,7 +188,7 @@ class RiskGate:
             except Exception as e:
                 log.warning(f"[RiskGate] on_fill_realized error {p.__class__.__name__}: {e}")
 
-    # ---------- 어댑터: 구 정책 호환 ----------
+    # ---------- 어댑터 ----------
     def allow_entry(self, symbol: str, price: float, portfolio: Dict[str, dict],
                     ctx: Optional[Dict[str, Any]] = None) -> bool:
         cx = self._merge_ctx(ctx)
@@ -202,14 +208,13 @@ class RiskGate:
                 except Exception as e:
                     log.warning(f"[RiskGate] size_hint error {p.__class__.__name__}: {e}")
         if hints:
-            qty = max(0, min(hints))  # 가장 보수적인 수량
+            qty = max(0, min(hints))
             log.info(f"[RiskGate] SIZE hints={hints} -> qty={qty}")
             return qty
 
-        # fallback: evaluate의 scale 이용
         ev = self.evaluate({**cx, "is_entry": True, "symbol": symbol, "price": price, "portfolio": portfolio})
         scale = float(ev.get("scale", 1.0))
-        base_qty = 1  # 필요시 설정화
+        base_qty = 1
         qty = int(max(0, round(base_qty * scale)))
         log.info(f"[RiskGate] SIZE (fallback) scale={scale:.2f} -> qty={qty}")
         return qty
@@ -217,16 +222,11 @@ class RiskGate:
     # ---------- Hub 호환 ----------
     def check(self, symbol: str, price: float, portfolio: Dict[str, dict],
               ctx: Optional[Dict[str, Any]] = None) -> Tuple[bool, str, Optional[int]]:
-        """
-        Hub에서 사용하는 인터페이스:
-        (allow: bool, reason: str, size_hint: Optional[int])
-        """
         cx = self._merge_ctx(ctx)
         ev = self.evaluate({**cx, "is_entry": True, "symbol": symbol, "price": price, "portfolio": portfolio})
         allow = bool(ev.get("allow", True))
         reason = str(ev.get("reason") or "ok")
 
-        # size_hint 수집
         hints: List[int] = []
         for p in self.policies:
             if hasattr(p, "size_hint"):
@@ -239,7 +239,6 @@ class RiskGate:
 
         size_hint = None
         if hints:
-            # 0도 힌트로 들어올 수 있으니 음수만 제외하고 최소값 채택
             hints = [int(q) for q in hints if q is not None and q >= 0]
             if hints:
                 size_hint = min(hints)
