@@ -35,6 +35,7 @@ class Position:
     entry_ts: float = 0.0
     exit_reason: Optional[str] = None
 
+
 @dataclass
 class RiskEvalRes:
     allow: bool
@@ -69,6 +70,7 @@ def _make_default_scorer() -> ScoreEngine:
     except Exception:
         return ScoreEngine()
 
+
 def _make_default_router():
     """OrderRouter를 환경에 맞춰 안전하게 생성"""
     try:
@@ -80,10 +82,11 @@ def _make_default_router():
         return OrderRouter()
     except Exception:
         try:
-            from order.adapters.mock import MockAdapter  # 있을 때만
+            from order.adapters.mock import MockAdapter
             return OrderRouter(adapter=MockAdapter())
         except Exception:
             raise RuntimeError("OrderRouter 초기화 방법을 찾지 못했습니다. router를 직접 주입해 주세요.")
+
 
 def _make_exposure_policy_or_none():
     """ExposurePolicy.default() 유무/시그니처 차이를 흡수, 실패 시 None"""
@@ -107,6 +110,7 @@ class Hub:
         router: OrderRouter,
         exit_rules: ExitRules,
         min_reentry_cooldown_ticks: int = 10,
+        config: Optional[Dict[str, Any]] = None,
     ):
         self.scorer = scorer
         self.risk = risk
@@ -117,6 +121,13 @@ class Hub:
         self.positions: Dict[str, Position] = {}
         self.recent_exit_tick: Dict[str, int] = {}  # 재진입 쿨다운 기록
         self.tick_idx: int = 0
+
+        # ---- Risk ctx 기본 슬롯
+        self.config: Dict[str, Any] = config or {}
+        self.sector_map: Dict[str, str] = {}  # 다음 단계(섹터 정책)에서 실제 값 주입
+        # equity/sector 노출 계산 스텁 (필요 시 덮어쓰기)
+        self._equity_now = lambda: float(self.config.get("budget") or 0.0)  # 예산을 기본 equity로
+        self._sector_exposure = lambda: {}
 
     # --- helper: PnL 기반 상태 업데이트 (trailing 고점 갱신 등)
     def _update_pos_state(self, pos: Position, last_price: float) -> None:
@@ -155,19 +166,108 @@ class Hub:
             for s, p in self.positions.items()
         }
 
-        # 2) ctx 보강
+        # 2) ctx 보강 (먼저 완성)
         safe_ctx: Dict[str, Any] = {}
         if isinstance(ctx, dict):
             safe_ctx.update(ctx)
+
+        budget_val = float(self.config.get("budget") or 0.0)
+        equity_val = float(self._equity_now() or budget_val)
+
+        # ExposurePolicy 호환용 블록/별칭
+        account_block = {"equity": equity_val}
+        exposure_block = {
+            "budget": budget_val,
+            "equity": equity_val,
+            "equity_now": equity_val,
+            "cash": budget_val,               # alias
+            "account": account_block,
+            "portfolio": portfolio,
+            "positions": portfolio,           # alias
+            "sector_map": self.sector_map,
+            "sector_exposure": self._sector_exposure() or {},
+        }
+
         safe_ctx.update({
             "tick_idx": self.tick_idx,
             "symbol": symbol,
             "price": price,
             "score": score,
-            "exposure": {"AAA": 0.0},  # 경고 억제용 기본 키
+
+            # top-level aliases
+            "budget": budget_val,
+            "equity": equity_val,
+            "equity_now": equity_val,
+            "cash": budget_val,
+            "account": account_block,
+            "portfolio": portfolio,
+            "positions": portfolio,
+            "sector_map": self.sector_map,
+            "sector_exposure": exposure_block["sector_exposure"],
+
+            # nested blocks (여러 구현 호환)
+            "exposure": exposure_block,
+            "exposure_ctx": exposure_block,
+            "risk_ctx": exposure_block,
         })
 
-        # 3) 다양한 구현을 지원하는 호출 시도 순서
+        # 2.5) RiskGate/Policy 인스턴스 속성에도 컨텍스트 강제 주입
+        try:
+            for attr in ("ctx", "_ctx", "exposure_ctx", "risk_ctx", "last_ctx", "_last_ctx"):
+                setattr(self.risk, attr, safe_ctx)
+            policies = getattr(self.risk, "policies", None)
+            if isinstance(policies, (list, tuple)):
+                for p in policies:
+                    for attr in ("ctx", "_ctx", "exposure_ctx", "risk_ctx", "last_ctx", "_last_ctx"):
+                        try:
+                            setattr(p, attr, safe_ctx)
+                        except Exception:
+                            pass
+                    if hasattr(p, "set_ctx") and callable(getattr(p, "set_ctx")):
+                        try:
+                            p.set_ctx(safe_ctx)
+                        except Exception:
+                            pass
+            if hasattr(self.risk, "set_ctx") and callable(getattr(self.risk, "set_ctx")):
+                try:
+                    self.risk.set_ctx(safe_ctx)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 3) 다양한 구현을 지원하는 호출 시도: kwargs 우선 → 위치인자 폴백
+        # 3-1) kwargs 우선
+        for meth in ("evaluate_entry", "evaluate", "check_entry", "gate", "allow"):
+            fn = getattr(r, meth, None)
+            if not callable(fn):
+                continue
+            try:
+                res = fn(symbol=symbol, price=price, portfolio=portfolio, score=score, ctx=safe_ctx)
+                # normalize
+                if isinstance(res, RiskEvalRes):
+                    return res
+                if hasattr(res, "allow"):
+                    return RiskEvalRes(bool(getattr(res, "allow")),
+                                       str(getattr(res, "reason", "")),
+                                       getattr(res, "max_qty_hint", None))
+                if isinstance(res, dict):
+                    return RiskEvalRes(bool(res.get("allow", True)),
+                                       str(res.get("reason", "")),
+                                       res.get("max_qty_hint"))
+                if isinstance(res, tuple) and res:
+                    allow = bool(res[0])
+                    reason = str(res[1]) if len(res) > 1 else ""
+                    hint = res[2] if len(res) > 2 else None
+                    return RiskEvalRes(allow, reason, hint)
+                if isinstance(res, bool):
+                    return RiskEvalRes(res)
+            except TypeError:
+                pass
+            except Exception as e:
+                return RiskEvalRes(False, reason=f"{meth}_error:{e}")
+
+        # 3-2) 위치 인자 폴백
         arg_sets = (
             (symbol, price, portfolio, score, safe_ctx),
             (symbol, price, portfolio, safe_ctx),
@@ -190,7 +290,6 @@ class Hub:
                 except Exception as e:
                     return RiskEvalRes(False, reason=f"{meth}_error:{e}")
 
-                # normalize
                 if isinstance(res, RiskEvalRes):
                     return res
                 if hasattr(res, "allow"):
@@ -243,7 +342,48 @@ class Hub:
     # --- main tick entry
     def on_tick(self, snapshot: Dict[str, float], ctx: Optional[Dict[str, Any]] = None) -> None:
         self.tick_idx += 1
-        ctx = ctx or {}
+
+        # 0) 실행 컨텍스트 구성
+        safe_ctx: Dict[str, Any] = {}
+        if isinstance(ctx, dict):
+            safe_ctx.update(ctx)
+
+        budget_val = float(self.config.get("budget") or 0.0)
+        equity_val = float(self._equity_now() or budget_val)
+        account_block = {"equity": equity_val}
+
+        exposure_block = {
+            "budget": budget_val,
+            "equity": equity_val,
+            "equity_now": equity_val,
+            "cash": budget_val,
+            "portfolio": {
+                s: {"qty": float(p.qty), "avg_price": float(p.avg_price)}
+                for s, p in self.positions.items()
+            },
+            "positions": {
+                s: {"qty": float(p.qty), "avg_price": float(p.avg_price)}
+                for s, p in self.positions.items()
+            },
+            "sector_map": self.sector_map,
+            "sector_exposure": self._sector_exposure() or {},
+            "account": account_block,
+        }
+
+        safe_ctx.update({
+            "budget": budget_val,
+            "equity": equity_val,
+            "equity_now": equity_val,
+            "cash": budget_val,
+            "sector_map": self.sector_map,
+            "sector_exposure": exposure_block["sector_exposure"],
+            "portfolio": exposure_block["portfolio"],
+            "positions": exposure_block["positions"],
+            "account": account_block,
+            "exposure": exposure_block,
+            "exposure_ctx": exposure_block,
+            "risk_ctx": exposure_block,
+        })
 
         # 1) 포지션 보유 종목: ExitRules 우선 평가
         if self.positions:
@@ -258,7 +398,7 @@ class Hub:
                     price_now=price,
                     avg_price=pos.avg_price,
                     last_high=pos.last_high,
-                    min_hold_ticks=1,  # 실전은 config로 노출
+                    min_hold_ticks=1,
                 )
                 if getattr(dec, "should_exit", False):
                     to_close.append((sym, pos, dec))
@@ -280,14 +420,14 @@ class Hub:
             if sym in self.positions:
                 continue
 
-            score = self._safe_score(sym, price, ctx)
-            risk_res = self._risk_eval(symbol=sym, price=price, score=score, ctx=ctx)
+            score = self._safe_score(sym, price, safe_ctx)
+            risk_res = self._risk_eval(symbol=sym, price=price, score=score, ctx=safe_ctx)
             if not risk_res.allow:
                 logger.debug(f"[RISK-HOLD] {sym} reason={risk_res.reason}")
                 continue
 
             qty_hint = risk_res.max_qty_hint or 0
-            qty = max(1, qty_hint)  # 간단 기본치
+            qty = max(1, qty_hint)
 
             if score >= self._get_buy_threshold():
                 self._buy(sym, price, qty, reason=f"score={score:.3f}")
@@ -302,6 +442,7 @@ class HubTrade:
         risk: Optional[RiskGate] = None,
         router: Optional[OrderRouter] = None,
         exit_rules: Optional[ExitRules] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
         self.symbols = symbols
         self.scorer = scorer if scorer is not None else _make_default_scorer()
@@ -318,12 +459,14 @@ class HubTrade:
 
         self.router = router or _make_default_router()
         self.exit_rules = exit_rules or ExitRules()
+        self.config = config or {}
 
         self.hub = Hub(
             scorer=self.scorer,
             risk=self.risk,
             router=self.router,
             exit_rules=self.exit_rules,
+            config=self.config,
         )
 
     def run_session(self, price_feed_iter, max_ticks: int = 1000):
@@ -334,4 +477,3 @@ class HubTrade:
             if ticks >= max_ticks:
                 break
         logger.info(f"[SESSION END] ticks={ticks}")
-

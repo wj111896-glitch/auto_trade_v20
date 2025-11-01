@@ -267,6 +267,13 @@ def main():
     if args.budget is not None:     
         cfg.budget = args.budget
 
+    # ✅ HubTrade로 넘길 실제 실행 설정(예산/모드/메모)
+    hub_config = {
+        "budget": cfg.budget,
+        "real_mode": cfg.real_mode,
+        "note": args.note or "",
+    }
+
     logger.info("=== DAYTRADE RUN START ===")
     logger.info("symbols=%s, max_ticks=%s, real_mode=%s, budget=%s, note=%s",
                 args.symbols, args.max_ticks, cfg.real_mode, cfg.budget, args.note)
@@ -278,6 +285,7 @@ def main():
         exit_rules=exit_rules,
         # 아래는 HubTrade가 사용한다면 전달; 아니면 무시됨
         scorer=None, risk=None, router=None,
+        config=hub_config,
     )
 
     # 실행
